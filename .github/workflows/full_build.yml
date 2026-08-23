@@ -1,4 +1,4 @@
-name: Windows Package Publish
+name: My own Windows Package Publish
 
 on:
   workflow_dispatch:
