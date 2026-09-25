@@ -385,6 +385,12 @@ namespace lfs::core::tensor_ops {
     LFS_CORE_API void launch_masked_fill(__half* data, const unsigned char* mask,
                                          __half value, size_t n, cudaStream_t stream);
 
+    // Clear entries in a group-valued mask where live_mask is zero. Unlike a
+    // logical-and expression this preserves non-zero group ids and writes the
+    // destination in place.
+    LFS_CORE_API void launch_and_live(uint8_t* mask, const unsigned char* live_mask,
+                                      size_t n, cudaStream_t stream);
+
     LFS_CORE_API void launch_masked_scatter(float* data, const unsigned char* mask,
                                             const float* src, size_t n, size_t src_size, cudaStream_t stream);
     LFS_CORE_API void launch_masked_scatter(__half* data, const unsigned char* mask,
@@ -594,6 +600,7 @@ namespace lfs::core::tensor_ops {
     LFS_CORE_API bool has_nan_gpu(const float* data, size_t n, cudaStream_t stream = nullptr);
     LFS_CORE_API bool has_inf_gpu(const float* data, size_t n, cudaStream_t stream = nullptr);
     LFS_CORE_API bool release_nan_check_thread_buffers() noexcept;
+    LFS_CORE_API void set_nan_check_host_allocation_failure_for_testing(bool fail);
 
     // ============= Fused Affine Transform =============
     LFS_CORE_API void launch_fused_affine_transform(const float* input, float* output,

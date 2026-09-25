@@ -12,6 +12,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <charconv>
+#include <cmath>
+#include <format>
+#include <optional>
 
 namespace lfs::mcp {
 
@@ -52,6 +56,54 @@ namespace lfs::mcp {
                 .fields = lfs::SmallFields{}.add("parameter", parameter),
             });
             return json{{"error", lfs::core::to_wire_envelope(error)}, {"error_message", message}};
+        }
+
+        [[nodiscard]] bool matches_declared_type(const json& value, const std::string& type) {
+            if (type == "string")
+                return value.is_string();
+            if (type == "integer" || type == "number")
+                return value.is_number();
+            if (type == "boolean")
+                return value.is_boolean();
+            if (type == "array")
+                return value.is_array();
+            if (type == "object")
+                return value.is_object();
+            return true;
+        }
+
+        // Agents often spell scalars in another type: "7" for an integer, "true" for a
+        // boolean, 5 for a string. Unambiguous spellings become the declared type.
+        [[nodiscard]] std::optional<json> coerce_to_declared_type(const json& value, const std::string& type) {
+            if (matches_declared_type(value, type))
+                return std::make_optional<json>(value);
+            if ((type == "integer" || type == "number") && value.is_string()) {
+                const auto& text = value.get_ref<const std::string&>();
+                const char* const begin = text.data();
+                const char* const end = begin + text.size();
+                if (type == "integer") {
+                    std::int64_t parsed = 0;
+                    const auto [last, ec] = std::from_chars(begin, end, parsed);
+                    if (!text.empty() && ec == std::errc{} && last == end)
+                        return std::make_optional<json>(parsed);
+                } else {
+                    double parsed = 0.0;
+                    const auto [last, ec] = std::from_chars(begin, end, parsed);
+                    if (!text.empty() && ec == std::errc{} && last == end && std::isfinite(parsed))
+                        return std::make_optional<json>(parsed);
+                }
+                return std::nullopt;
+            }
+            if (type == "boolean" && value.is_string()) {
+                if (value == "true")
+                    return std::make_optional<json>(true);
+                if (value == "false")
+                    return std::make_optional<json>(false);
+                return std::nullopt;
+            }
+            if (type == "string" && (value.is_number() || value.is_boolean()))
+                return std::make_optional<json>(value.dump());
+            return std::nullopt;
         }
 
         json invoke_handler_guarded(const std::string& name, const ToolRegistry::ToolHandler& handler,
@@ -124,6 +176,40 @@ namespace lfs::mcp {
         return inst;
     }
 
+    void ToolRegistry::set_lazy_initializer(std::function<void()> initializer) {
+        std::lock_guard lock(mutex_);
+        lazy_initializer_ = std::move(initializer);
+    }
+
+    void ToolRegistry::ensure_initialized() const {
+        std::call_once(initialization_once_, [this] {
+            std::function<void()> initializer;
+            {
+                std::lock_guard lock(mutex_);
+                initializer = lazy_initializer_;
+            }
+            if (initializer)
+                initializer();
+        });
+    }
+
+    void ResourceRegistry::set_lazy_initializer(std::function<void()> initializer) {
+        std::lock_guard lock(mutex_);
+        lazy_initializer_ = std::move(initializer);
+    }
+
+    void ResourceRegistry::ensure_initialized() const {
+        std::call_once(initialization_once_, [this] {
+            std::function<void()> initializer;
+            {
+                std::lock_guard lock(mutex_);
+                initializer = lazy_initializer_;
+            }
+            if (initializer)
+                initializer();
+        });
+    }
+
     void ToolRegistry::register_tool(McpTool tool, ToolHandler handler) {
         const std::string normalized_name = normalize_tool_name(tool.name);
         if (!is_valid_tool_name(normalized_name)) {
@@ -155,6 +241,7 @@ namespace lfs::mcp {
     }
 
     std::vector<McpTool> ToolRegistry::list_tools() const {
+        ensure_initialized();
         std::lock_guard lock(mutex_);
         std::vector<McpTool> result;
         result.reserve(tools_.size());
@@ -169,8 +256,10 @@ namespace lfs::mcp {
 
     json ToolRegistry::call_tool(const std::string& name, const json& arguments,
                                  lfs::OperationId operation_id) {
+        ensure_initialized();
         ToolHandler handler;
         std::vector<std::string> required;
+        json properties;
         {
             std::lock_guard lock(mutex_);
             const std::string normalized_name = normalize_tool_name(name);
@@ -180,16 +269,43 @@ namespace lfs::mcp {
                                                 name, operation_id);
             handler = it->second.handler;
             required = it->second.tool.input_schema.required;
+            properties = it->second.tool.input_schema.properties;
         }
 
+        if (!arguments.is_null() && !arguments.is_object())
+            return parameter_error_envelope(lfs::ErrorCode::InvalidArgument,
+                                            "Tool arguments must be an object", "arguments", operation_id);
+
         for (const auto& field : required) {
-            if (!arguments.contains(field))
+            if (!arguments.contains(field) || arguments.at(field).is_null())
                 return parameter_error_envelope(lfs::ErrorCode::InvalidArgument,
                                                 "Missing required parameter: " + field, field,
                                                 operation_id);
         }
 
-        return bridge_tool_result(invoke_handler_guarded(name, handler, arguments, operation_id),
+        // A mistyped argument is the caller's error and must not reach the handler, where
+        // reading it would throw as an internal failure. Null keeps its per-tool meaning.
+        json checked_arguments = arguments;
+        if (properties.is_object() && arguments.is_object()) {
+            for (const auto& [key, value] : arguments.items()) {
+                const auto property = properties.find(key);
+                if (value.is_null() || property == properties.end() || !property->is_object())
+                    continue;
+                const auto type = property->find("type");
+                if (type == property->end() || !type->is_string())
+                    continue;
+                auto coerced = coerce_to_declared_type(value, type->get<std::string>());
+                if (!coerced) {
+                    return parameter_error_envelope(
+                        lfs::ErrorCode::InvalidArgument,
+                        std::format("Parameter '{}' must be of type {}", key, type->get<std::string>()), key,
+                        operation_id);
+                }
+                checked_arguments[key] = std::move(*coerced);
+            }
+        }
+
+        return bridge_tool_result(invoke_handler_guarded(name, handler, checked_arguments, operation_id),
                                   name, operation_id);
     }
 
@@ -211,6 +327,7 @@ namespace lfs::mcp {
     }
 
     std::vector<McpResource> ResourceRegistry::list_resources() const {
+        ensure_initialized();
         std::lock_guard lock(mutex_);
         std::vector<McpResource> result;
         result.reserve(resources_.size());
@@ -224,6 +341,7 @@ namespace lfs::mcp {
     }
 
     std::expected<std::vector<McpResourceContent>, std::string> ResourceRegistry::read_resource(const std::string& uri) const {
+        ensure_initialized();
         ResourceHandler handler;
         {
             std::lock_guard lock(mutex_);
@@ -458,11 +576,13 @@ namespace lfs::mcp {
                 return json{
                     {"iteration", snapshot.iteration},
                     {"max_iterations", snapshot.max_iterations},
+                    {"strategy", snapshot.strategy},
                     {"num_gaussians", snapshot.num_gaussians},
                     {"loss", snapshot.loss},
                     {"is_running", snapshot.is_running},
                     {"is_paused", snapshot.is_paused},
                     {"is_refining", snapshot.is_refining},
+                    {"session_hydrated", snapshot.session_hydrated},
                     {"project_snapshot",
                      {
                          {"completed",

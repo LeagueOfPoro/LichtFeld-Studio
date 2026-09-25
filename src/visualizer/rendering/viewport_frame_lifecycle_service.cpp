@@ -5,6 +5,9 @@
 #include "viewport_frame_lifecycle_service.hpp"
 #include "viewport_artifact_service.hpp"
 
+#include <algorithm>
+#include <utility>
+
 namespace lfs::vis {
 
     namespace {
@@ -56,8 +59,9 @@ namespace lfs::vis {
 
     ViewportFrameLifecycleService::ModelChangeResult
     ViewportFrameLifecycleService::handleModelChange(const size_t model_ptr,
-                                                     ViewportArtifactService& viewport_artifacts) {
-        if (model_ptr == last_model_ptr_) {
+                                                     ViewportArtifactService& viewport_artifacts,
+                                                     const ModelSource source) {
+        if (model_ptr == last_model_ptr_ && source == last_model_source_) {
             return {};
         }
 
@@ -65,6 +69,7 @@ namespace lfs::vis {
             .changed = true,
             .previous_model_ptr = last_model_ptr_};
         last_model_ptr_ = model_ptr;
+        last_model_source_ = source;
         viewport_artifacts.clearViewportOutput();
         return result;
     }
@@ -72,8 +77,9 @@ namespace lfs::vis {
     DirtyMask ViewportFrameLifecycleService::handleTrainingRefresh(const bool is_training,
                                                                    const float refresh_interval_sec) {
         if (!is_training) {
-            return 0;
+            return std::exchange(training_refreshing_, false) ? DirtyFlag::SPLATS : 0;
         }
+        training_refreshing_ = true;
 
         const auto now = std::chrono::steady_clock::now();
         const auto interval = std::chrono::duration<float>(refresh_interval_sec);
@@ -83,6 +89,13 @@ namespace lfs::vis {
 
         last_training_render_ = now;
         return DirtyFlag::SPLATS;
+    }
+
+    double ViewportFrameLifecycleService::secondsUntilTrainingRefresh(const float refresh_interval_sec) const {
+        const auto due = last_training_render_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                                     std::chrono::duration<float>(refresh_interval_sec));
+        const auto remaining = due - std::chrono::steady_clock::now();
+        return std::max(0.0, std::chrono::duration<double>(remaining).count());
     }
 
     DirtyMask ViewportFrameLifecycleService::requiredDirtyMask(const bool has_viewport_output,

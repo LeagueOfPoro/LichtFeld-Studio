@@ -10,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -70,10 +71,17 @@ namespace lfs::io {
         bool load_masks = false;
         bool load_depths = false;
         bool load_normals = false;
+        // When true, a normal map that fails the size contract is ignored (one
+        // warning naming the file) so auto-generate can overwrite it. When false,
+        // the load fails with NORMAL_SIZE_MISMATCH as before.
+        bool normal_auto_generate = false;
         CentralizeDataset centralize = CentralizeDataset::Off;
         ProgressCallback progress = nullptr;
         CancelCallback cancel_requested = nullptr;
         SplatTensorAllocator splat_tensor_allocator = {};
+        // When true, and splat_tensor_allocator is set, PLY SH-rest is encoded to
+        // q16 on the way in (no float32 SplatData.shN GPU workspace).
+        bool shN_q16 = false;
     };
 
     class LoadCancelledError : public std::runtime_error {
@@ -129,6 +137,7 @@ namespace lfs::io {
         std::chrono::milliseconds load_time{0};
         std::vector<std::string> warnings;
         std::optional<ImportGeoreference> georeference;
+        std::optional<std::vector<std::uint8_t>> license_bytes;
     };
 
     /**

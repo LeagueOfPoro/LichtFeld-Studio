@@ -24,7 +24,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LFS_VCPKG_OVERL
 # cache values are visible before project(), when the vcpkg toolchain resolves
 # manifest features.
 list(REMOVE_ITEM VCPKG_MANIFEST_FEATURES tests vulkan-validation)
-if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS)
+if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS)
     list(APPEND VCPKG_MANIFEST_FEATURES tests)
 endif()
 
@@ -91,7 +91,15 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "MinSizeRel" "RelWithDebInfo")
 endif()
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/VcpkgProfiles.cmake")
+lfs_validate_vcpkg_profile()
+
 project(LichtFeld-Studio VERSION 0.5.3 LANGUAGES CUDA CXX C)
+
+if(WIN32)
+    enable_language(RC)
+endif()
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsVersionResource.cmake")
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SelectFastLinker.cmake")
 
@@ -162,38 +170,11 @@ add_custom_target(lfs_git_version ALL
     VERBATIM
 )
 
-# App/core ABI tripwire. Hash every lfs_core implementation and interface input,
-# because a dirty-worktree rebuild cannot rely on the Git commit alone to
-# distinguish a newly linked app from a stale shared library.
-file(GLOB_RECURSE LFS_CORE_BUILD_INPUTS CONFIGURE_DEPENDS
-    "${CMAKE_SOURCE_DIR}/src/core/*.cpp"
-    "${CMAKE_SOURCE_DIR}/src/core/*.cu"
-    "${CMAKE_SOURCE_DIR}/src/core/*.cuh"
-    "${CMAKE_SOURCE_DIR}/src/core/*.hpp"
-)
-list(APPEND LFS_CORE_BUILD_INPUTS
-    "${CMAKE_SOURCE_DIR}/src/core/CMakeLists.txt"
-)
-list(SORT LFS_CORE_BUILD_INPUTS)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    ${LFS_CORE_BUILD_INPUTS}
-)
-set(_lfs_core_abi_material
-    "${PROJECT_VERSION}|${GIT_COMMIT_HASH_SHORT}|${CMAKE_BUILD_TYPE}|${CMAKE_SYSTEM_NAME}|${CMAKE_SIZEOF_VOID_P}|${CMAKE_CXX_COMPILER_ID}|${CMAKE_CXX_COMPILER_VERSION}|${CMAKE_CUDA_COMPILER_ID}|${CMAKE_CUDA_COMPILER_VERSION}|${CMAKE_CUDA_ARCHITECTURES}|${VCPKG_TARGET_TRIPLET}")
-foreach(_lfs_core_build_input IN LISTS LFS_CORE_BUILD_INPUTS)
-    file(SHA256 "${_lfs_core_build_input}" _lfs_core_build_input_hash)
-    string(APPEND _lfs_core_abi_material "|${_lfs_core_build_input_hash}")
-endforeach()
-string(SHA256 LFS_CORE_ABI_STAMP "${_lfs_core_abi_material}")
-configure_file(
-    "${CMAKE_SOURCE_DIR}/cmake/lfs_core_abi_stamp.h.in"
-    "${CMAKE_BINARY_DIR}/include/lfs_core_abi_stamp.h"
-    @ONLY
-)
-
 option(BUILD_TESTS "Build tests" OFF)
+option(BUILD_PANEL_LAYOUT_TESTS "Build focused panel layout and registry tests" OFF)
+option(BUILD_VISUALIZER_TESTS "Build CPU-only visualizer tests without LibTorch" OFF)
 option(BUILD_FORMAT_TESTS "Build only the CPU-only .licht format tests (no CUDA)" OFF)
-option(BUILD_UNICODE_TEST_ONLY "Build only Unicode path test (no CUDA)" OFF)
+option(BUILD_UNICODE_TEST_ONLY "Build only Unicode path tests (no CUDA runtime linkage)" OFF)
 option(BUILD_LOCALIZATION_TESTS "Register headless localization contract tests without LibTorch" OFF)
 option(LFS_FAST_COMPILE "Optimize measured slow C++ components for build speed instead of runtime speed (WIN32 only)" OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -354,6 +335,17 @@ else()
     message(STATUS "Compiler cache: disabled")
 endif()
 
+if(MSVC)
+    foreach(_lfs_language IN ITEMS C CXX CUDA)
+        set(CMAKE_${_lfs_language}_COMPILER_LAUNCHER
+            "${CMAKE_COMMAND}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/NormalizeMsvcFlags.cmake"
+            --
+            ${CMAKE_${_lfs_language}_COMPILER_LAUNCHER})
+    endforeach()
+    unset(_lfs_language)
+endif()
+
 # Minimum SM for PTX-only (75=Turing, 80=Ampere, 86=GA102, 89=Ada, 90=Hopper)
 set(BUILD_CUDA_MIN_SM "75" CACHE STRING "Minimum SM for PTX-only builds")
 
@@ -403,7 +395,7 @@ if(NVIDIA_SMI)
         set(LichtFeld-Studio_CUDA_ARCH "native")
     endif()
 else()
-    message(WARNING "nvidia-smi not found! We are likely in CI, default to 8.6.")
+    message(STATUS "nvidia-smi not found; using CUDA architecture 8.6 for this build")
     set(DETECTED_COMPUTE_CAP 8.6)
     set(LichtFeld-Studio_CUDA_ARCH "86")
 endif()
@@ -451,77 +443,6 @@ if(WIN32)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --diag-suppress 221,1394,1388 -Xcompiler=/wd4267 -Xcompiler=/Zc:preprocessor")
 endif()
 
-# cuDNN 9 runtime libraries are loaded indirectly by ONNX Runtime's CUDA
-# provider, so CMake's runtime dependency scanner only sees part of the set.
-# Discover the CUDA-versioned cuDNN bin directory explicitly and copy every
-# cudnn*.dll beside the executable / into portable installs on Windows.
-set(LFS_CUDNN_BIN_DIR "" CACHE PATH "Path to the cuDNN runtime DLL directory")
-set(CUDNN_ROOT_DIR "" CACHE PATH "Path to the cuDNN installation root")
-set(_lfs_cudnn_runtime_libs "")
-set(_lfs_cudnn_bin_dir "")
-if(WIN32)
-    function(_lfs_append_cudnn_bin_candidate OUT_VAR DIR)
-        if(DIR)
-            file(TO_CMAKE_PATH "${DIR}" _candidate)
-            list(APPEND ${OUT_VAR} "${_candidate}")
-            set(${OUT_VAR} "${${OUT_VAR}}" PARENT_SCOPE)
-        endif()
-    endfunction()
-
-    function(_lfs_append_cudnn_root_candidates OUT_VAR ROOT)
-        if(ROOT)
-            file(TO_CMAKE_PATH "${ROOT}" _root)
-            if(CUDAToolkit_VERSION_MAJOR AND CUDAToolkit_VERSION_MINOR)
-                _lfs_append_cudnn_bin_candidate(${OUT_VAR} "${_root}/bin/${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR}/x64")
-            endif()
-            if(CUDAToolkit_VERSION_MAJOR)
-                file(GLOB _major_matches LIST_DIRECTORIES true "${_root}/bin/${CUDAToolkit_VERSION_MAJOR}.*/x64")
-                list(SORT _major_matches COMPARE NATURAL ORDER DESCENDING)
-                foreach(_major_match IN LISTS _major_matches)
-                    _lfs_append_cudnn_bin_candidate(${OUT_VAR} "${_major_match}")
-                endforeach()
-            endif()
-            _lfs_append_cudnn_bin_candidate(${OUT_VAR} "${_root}/bin/x64")
-            _lfs_append_cudnn_bin_candidate(${OUT_VAR} "${_root}/bin")
-            set(${OUT_VAR} "${${OUT_VAR}}" PARENT_SCOPE)
-        endif()
-    endfunction()
-
-    set(_lfs_cudnn_bin_candidates "")
-    _lfs_append_cudnn_bin_candidate(_lfs_cudnn_bin_candidates "${LFS_CUDNN_BIN_DIR}")
-    _lfs_append_cudnn_root_candidates(_lfs_cudnn_bin_candidates "${CUDNN_ROOT_DIR}")
-    _lfs_append_cudnn_root_candidates(_lfs_cudnn_bin_candidates "$ENV{CUDNN_ROOT_DIR}")
-    _lfs_append_cudnn_bin_candidate(_lfs_cudnn_bin_candidates "$ENV{CUDNN_BIN_DIR}")
-    _lfs_append_cudnn_root_candidates(_lfs_cudnn_bin_candidates "$ENV{CUDNN_ROOT}")
-    _lfs_append_cudnn_root_candidates(_lfs_cudnn_bin_candidates "$ENV{CUDNN_PATH}")
-
-    file(GLOB _lfs_common_cudnn_roots LIST_DIRECTORIES true "C:/Program Files/NVIDIA/CUDNN/v*")
-    list(SORT _lfs_common_cudnn_roots COMPARE NATURAL ORDER DESCENDING)
-    foreach(_lfs_common_cudnn_root IN LISTS _lfs_common_cudnn_roots)
-        _lfs_append_cudnn_root_candidates(_lfs_cudnn_bin_candidates "${_lfs_common_cudnn_root}")
-    endforeach()
-    list(REMOVE_DUPLICATES _lfs_cudnn_bin_candidates)
-
-    foreach(_lfs_cudnn_candidate IN LISTS _lfs_cudnn_bin_candidates)
-        file(GLOB _lfs_cudnn_candidate_dlls CONFIGURE_DEPENDS "${_lfs_cudnn_candidate}/cudnn*.dll")
-        if(_lfs_cudnn_candidate_dlls)
-            set(_lfs_cudnn_bin_dir "${_lfs_cudnn_candidate}")
-            set(_lfs_cudnn_runtime_libs ${_lfs_cudnn_candidate_dlls})
-            list(SORT _lfs_cudnn_runtime_libs)
-            break()
-        endif()
-    endforeach()
-
-    if(_lfs_cudnn_runtime_libs)
-        list(LENGTH _lfs_cudnn_runtime_libs _lfs_cudnn_runtime_lib_count)
-        message(STATUS "cuDNN runtime DLLs: ${_lfs_cudnn_runtime_lib_count} found in ${_lfs_cudnn_bin_dir}")
-    elseif(BUILD_PORTABLE)
-        message(FATAL_ERROR "cuDNN runtime DLLs were not found. Set CUDNN_ROOT_DIR to the cuDNN root, or LFS_CUDNN_BIN_DIR to the CUDA-versioned cuDNN bin directory.")
-    else()
-        message(WARNING "cuDNN runtime DLLs were not found. Set CUDNN_ROOT_DIR or LFS_CUDNN_BIN_DIR if CUDA preprocessing/runtime inference needs cuDNN.")
-    endif()
-endif()
-
 # Create nvToolsExt target BEFORE finding Torch (PyTorch expects this)
 if(NOT TARGET CUDA::nvToolsExt)
     find_library(NVTOOLSEXT_LIBRARY
@@ -562,43 +483,22 @@ find_package(glm REQUIRED)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupNativeFileDialog.cmake")
 find_package(nlohmann_json REQUIRED)
 find_package(args REQUIRED)
+find_package(fmt CONFIG REQUIRED)
+find_package(JPEG REQUIRED)
+find_package(PNG REQUIRED)
+find_package(TIFF REQUIRED)
 find_package(spdlog REQUIRED)
 find_package(Freetype REQUIRED)
 find_package(WebP REQUIRED)
+find_package(tinyexr CONFIG REQUIRED)
 find_package(LibArchive REQUIRED)
 find_package(zstd CONFIG REQUIRED)
 find_package(libdeflate CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
 find_package(xxHash CONFIG REQUIRED)
-find_package(OpenImageIO REQUIRED)
 find_package(OpenSSL REQUIRED)
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/SetupOnnxRuntime.cmake")
-find_package(pxr CONFIG REQUIRED)
 find_package(assimp REQUIRED)
 find_package(RmlUi CONFIG REQUIRED)
-
-# OpenImageIO's static vcpkg target exposes fmt::fmt-header-only through
-# OpenImageIO_Util. That definition is needed by TUs which include OIIO, but it
-# otherwise makes every source in a consumer instantiate fmt. Preserve OIIO's
-# own public compile interface while making the static archive closure link-only;
-# each of our five OIIO source files opts into FMT_HEADER_ONLY explicitly.
-add_library(lfs_oiio INTERFACE)
-target_link_libraries(lfs_oiio INTERFACE "$<LINK_ONLY:OpenImageIO::OpenImageIO>")
-get_target_property(_lfs_oiio_includes OpenImageIO::OpenImageIO INTERFACE_INCLUDE_DIRECTORIES)
-if(_lfs_oiio_includes)
-    target_include_directories(lfs_oiio SYSTEM INTERFACE ${_lfs_oiio_includes})
-endif()
-get_target_property(_lfs_oiio_definitions OpenImageIO::OpenImageIO INTERFACE_COMPILE_DEFINITIONS)
-if(_lfs_oiio_definitions)
-    target_compile_definitions(lfs_oiio INTERFACE ${_lfs_oiio_definitions})
-endif()
-get_target_property(_lfs_oiio_features OpenImageIO::OpenImageIO INTERFACE_COMPILE_FEATURES)
-if(_lfs_oiio_features)
-    target_compile_features(lfs_oiio INTERFACE ${_lfs_oiio_features})
-endif()
-unset(_lfs_oiio_includes)
-unset(_lfs_oiio_definitions)
-unset(_lfs_oiio_features)
 
 # Vulkan-native depth: glm::perspective/ortho/frustum must emit clip-space z in
 # [0, 1], not OpenGL's [-1, 1]. Keeps gl_FragDepth, the grid pass, the depth-
@@ -616,6 +516,36 @@ configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/config.h.in"
         "${CMAKE_CURRENT_BINARY_DIR}/include/config.h"
         @ONLY
+)
+
+# App/core ABI tripwire. Seed headers for IDEs and syntax checks at configure
+# time, then refresh before ABI consumers build without making core source/header
+# edits configure dependencies. Define this after the effective CUDA architecture
+# selection so the stamp represents the actual
+# target configuration. Each multi-config configuration gets its own header so
+# Debug and Release cannot race or overwrite each other.
+include(cmake/InitializeCoreAbiStamp.cmake)
+lfs_initialize_core_abi_stamps()
+add_custom_target(lfs_core_abi_stamp ALL
+    BYPRODUCTS "${LFS_CORE_ABI_HEADER}"
+    COMMAND ${CMAKE_COMMAND}
+        "-DLFS_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DLFS_CORE_ABI_TEMPLATE=${CMAKE_SOURCE_DIR}/cmake/lfs_core_abi_stamp.h.in"
+        "-DLFS_CORE_ABI_HEADER=${LFS_CORE_ABI_HEADER}"
+        "-DLFS_PROJECT_VERSION=${PROJECT_VERSION}"
+        "-DLFS_CONFIGURED_GIT_COMMIT_HASH_SHORT=${GIT_COMMIT_HASH_SHORT}"
+        "-DLFS_BUILD_CONFIG=$<CONFIG>"
+        "-DLFS_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}"
+        "-DLFS_SIZEOF_VOID_P=${CMAKE_SIZEOF_VOID_P}"
+        "-DLFS_CXX_COMPILER_ID=${CMAKE_CXX_COMPILER_ID}"
+        "-DLFS_CXX_COMPILER_VERSION=${CMAKE_CXX_COMPILER_VERSION}"
+        "-DLFS_CUDA_COMPILER_ID=${CMAKE_CUDA_COMPILER_ID}"
+        "-DLFS_CUDA_COMPILER_VERSION=${CMAKE_CUDA_COMPILER_VERSION}"
+        "-DLFS_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}"
+        "-DLFS_VCPKG_TARGET_TRIPLET=${VCPKG_TARGET_TRIPLET}"
+        -P "${CMAKE_SOURCE_DIR}/cmake/GenerateCoreAbiStamp.cmake"
+    COMMENT "Refreshing lfs_core ABI stamp"
+    VERBATIM
 )
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -643,6 +573,10 @@ endif()
 
 if(LFS_ENABLE_CUDA_DEVICE_DEBUG)
     add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-G>)
+else()
+    # Device debug already includes line information; passing both flags makes
+    # nvcc and ptxas warn about the redundant, overridden -lineinfo option.
+    add_compile_options($<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-lineinfo>)
 endif()
 
 add_compile_definitions(
@@ -684,8 +618,28 @@ add_executable(${PROJECT_NAME}
     src/app/mcp_sequencer_tools.cpp
     src/app/mcp_ui_registry_tools.cpp
     src/app/converter.cpp
+    src/app/converter_output_paths.cpp
+    src/app/converter_overwrite.cpp
     resources/lichtfeld-studio.rc
+    resources/lichtfeld-studio.manifest
 )
+
+add_dependencies(${PROJECT_NAME} lfs_core_abi_stamp)
+target_include_directories(${PROJECT_NAME} BEFORE PRIVATE
+    "${LFS_CORE_ABI_INCLUDE_DIR}"
+)
+
+# Give every first-party Windows binary a consistent product identity. This
+# also covers lfs_core.dll, which Defender has flagged in local source builds.
+lfs_add_windows_version_resource(${PROJECT_NAME} "LichtFeld Studio")
+lfs_add_windows_version_resource(lfs_core "LichtFeld Studio core and tensor runtime")
+lfs_add_windows_version_resource(lfs_diagnostics "LichtFeld Studio diagnostics")
+lfs_add_windows_version_resource(lfs_logger "LichtFeld Studio logging")
+lfs_add_windows_version_resource(lfs_event_bridge "LichtFeld Studio event bridge")
+lfs_add_windows_version_resource(lfs_visualizer "LichtFeld Studio visualizer")
+lfs_add_windows_version_resource(lfs_mcp "LichtFeld Studio MCP server")
+lfs_add_windows_version_resource(lfs_python_runtime "LichtFeld Studio Python runtime")
+lfs_add_windows_version_resource(lfs_py "LichtFeld Studio Python module")
 
 # The binary only carries code for these architectures; the app refuses to start on anything
 # lower instead of dying inside the first kernel launch (#1540).
@@ -812,30 +766,6 @@ if(TARGET nvimgcodec)
     message(STATUS "Post-build: nvImageCodec libraries will be copied to executable directory")
 endif()
 
-# ONNX Runtime dlopens its CUDA execution providers at runtime. Keep the core
-# runtime and CUDA/shared provider libraries beside the exe so local and packaged
-# preprocess runs do not silently fall back to CPU.
-set(_lfs_ort_runtime_libs ${LFS_ONNXRUNTIME_RUNTIME_LIBS})
-if(NOT _lfs_ort_runtime_libs AND DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
-    file(GLOB _lfs_ort_runtime_libs
-        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/*onnxruntime*"
-        "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin/*onnxruntime*")
-endif()
-list(FILTER _lfs_ort_runtime_libs INCLUDE REGEX "\\.(dll|dylib|so(\\.[0-9]+)*)$")
-list(REMOVE_DUPLICATES _lfs_ort_runtime_libs)
-if(_lfs_ort_runtime_libs)
-    foreach(_lfs_ort_runtime_lib IN LISTS _lfs_ort_runtime_libs)
-        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${_lfs_ort_runtime_lib}"
-                "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-            COMMENT "Copying ONNX Runtime runtime library"
-        )
-    endforeach()
-else()
-    message(WARNING "ONNX Runtime runtime libraries were not found; preprocess CUDA inference may fall back to CPU or fail at startup")
-endif()
-
 # Copy Python DLLs for Windows runtime (Python is embedded in the application)
 if(WIN32)
     get_filename_component(VCPKG_PYTHON_DIR "${Python_EXECUTABLE}" DIRECTORY)
@@ -874,16 +804,6 @@ if(WIN32 AND CUDAToolkit_FOUND)
     message(STATUS "Post-build: CUDA DLLs will be copied from ${CUDAToolkit_BIN_DIR}")
 endif()
 
-if(WIN32 AND _lfs_cudnn_runtime_libs)
-    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${_lfs_cudnn_runtime_libs}
-            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-        COMMENT "Copying cuDNN DLLs to executable directory"
-    )
-    message(STATUS "Post-build: cuDNN DLLs will be copied from ${_lfs_cudnn_bin_dir}")
-endif()
-
 # =============================================================================
 # VCPKG DLL COPYING - Ensure all vcpkg DLLs are available at runtime
 # =============================================================================
@@ -896,8 +816,17 @@ if(WIN32 AND DEFINED VCPKG_TARGET_TRIPLET)
     set(_vcpkg_debug_bin_dir "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin")
     set(_vcpkg_release_bin_dir "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin")
     file(GLOB _vcpkg_release_dlls CONFIGURE_DEPENDS "${_vcpkg_release_bin_dir}/*.dll")
-    file(GLOB _vcpkg_debug_dlls CONFIGURE_DEPENDS "${_vcpkg_debug_bin_dir}/*.dll")
-    
+
+    # A single-config Release/RelWithDebInfo build never consumes Debug DLLs,
+    # so changes in debug/bin must not invalidate its CMake graph. Multi-config
+    # generators still need both lists because one graph serves all configs.
+    get_property(_is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    if(_is_multi_config OR CMAKE_BUILD_TYPE STREQUAL "Debug")
+        file(GLOB _vcpkg_debug_dlls CONFIGURE_DEPENDS "${_vcpkg_debug_bin_dir}/*.dll")
+    else()
+        set(_vcpkg_debug_dlls)
+    endif()
+
     # Always copy release DLLs - needed for both Release and Debug builds
     if(_vcpkg_release_dlls)
         add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
@@ -907,11 +836,10 @@ if(WIN32 AND DEFINED VCPKG_TARGET_TRIPLET)
             COMMENT "Copying vcpkg release DLLs"
         )
     endif()
-    
+
     # Only copy debug DLLs for Debug builds (they link to debug CRT which breaks Release)
     # For single-config generators (Ninja, Makefiles): check CMAKE_BUILD_TYPE
     # For multi-config generators (VS, Xcode): use generator expression
-    get_property(_is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
     if(_is_multi_config)
         # Multi-config: use generator expression to conditionally copy
         if(_vcpkg_debug_dlls)
@@ -1142,6 +1070,9 @@ add_custom_target(copy_locale_files
     COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
         "${CMAKE_SOURCE_DIR}/src/visualizer/gui/resources/locales"
         "${RESOURCE_DIR}/locales"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/src/visualizer/gui/resources/locale_index.json"
+        "${RESOURCE_DIR}/locale_index.json"
     COMMENT "Syncing locale files"
 )
 add_dependencies(${PROJECT_NAME} copy_locale_files)
@@ -1156,57 +1087,6 @@ add_custom_target(copy_viewer_resource_files
     COMMENT "Syncing HTML viewer export resources"
 )
 add_dependencies(${PROJECT_NAME} copy_viewer_resource_files)
-
-# OpenUSD runtime resources (schema/file-format plugin metadata).
-# On Windows: copy to <exe>/usd/ so that relative LibraryPaths resolve to the
-# DLL copies already loaded from the exe directory.
-# On Linux: copy to <exe>/../lib/usd/ (conventional layout).
-set(_USD_PLUGIN_SOURCE_DIR "")
-foreach(_candidate
-    "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib/usd"
-    "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/usd"
-    "${CMAKE_BINARY_DIR}/src/python/usd")
-    # Require an actual plugin sub-directory (not just the root index).
-    if(NOT _USD_PLUGIN_SOURCE_DIR AND EXISTS "${_candidate}/ar/resources/plugInfo.json")
-        set(_USD_PLUGIN_SOURCE_DIR "${_candidate}")
-    endif()
-endforeach()
-
-set(_USD_ROOT_INDEX "")
-foreach(_candidate
-    "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib/usd/plugInfo.json"
-    "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/usd/plugInfo.json"
-    "${CMAKE_BINARY_DIR}/src/python/usd/plugInfo.json")
-    if(NOT _USD_ROOT_INDEX AND EXISTS "${_candidate}")
-        set(_USD_ROOT_INDEX "${_candidate}")
-    endif()
-endforeach()
-
-if(WIN32)
-    set(_USD_PLUGIN_DEST "$<TARGET_FILE_DIR:${PROJECT_NAME}>/usd")
-else()
-    set(_USD_PLUGIN_DEST "$<TARGET_FILE_DIR:${PROJECT_NAME}>/../lib/usd")
-endif()
-
-if(EXISTS "${_USD_PLUGIN_SOURCE_DIR}")
-    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${_USD_PLUGIN_DEST}"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different
-            "${_USD_PLUGIN_SOURCE_DIR}"
-            "${_USD_PLUGIN_DEST}"
-        COMMENT "Copying OpenUSD plugin resources (per-module)"
-    )
-    message(STATUS "Post-build: OpenUSD plugin resources will be copied from ${_USD_PLUGIN_SOURCE_DIR}")
-endif()
-
-if(EXISTS "${_USD_ROOT_INDEX}")
-    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${_USD_ROOT_INDEX}"
-            "${_USD_PLUGIN_DEST}/plugInfo.json"
-        COMMENT "Copying OpenUSD root plugin index"
-    )
-endif()
 
 message(STATUS "Post-build: Resources will be copied to \${BUILD_DIR}/resources/")
 
@@ -1335,13 +1215,17 @@ endif()
 # =============================================================================
 # TESTING (Optional)
 # =============================================================================
-if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_LOCALIZATION_TESTS)
+if(BUILD_TESTS OR BUILD_UNICODE_TEST_ONLY OR BUILD_FORMAT_TESTS OR BUILD_LOCALIZATION_TESTS OR BUILD_PANEL_LAYOUT_TESTS OR BUILD_VISUALIZER_TESTS)
     enable_testing()
     add_subdirectory(tests)
     if(BUILD_UNICODE_TEST_ONLY)
         message(STATUS "Unicode path test enabled. Build with 'ninja unicode_path_test' and run with 'ctest -R UnicodePathTest'")
     elseif(BUILD_LOCALIZATION_TESTS AND NOT BUILD_TESTS)
         message(STATUS "Headless localization tests enabled. Build with 'ninja test_localization_contracts' and run with 'ctest -R LocalizationContracts'")
+    elseif(BUILD_PANEL_LAYOUT_TESTS AND NOT BUILD_TESTS)
+        message(STATUS "Panel layout tests enabled. Build target panel_layout_tests to run them")
+    elseif(BUILD_VISUALIZER_TESTS AND NOT BUILD_TESTS)
+        message(STATUS "CPU-only visualizer tests enabled. Build target lichtfeld_visualizer_tests and run with 'ctest -R lichtfeld_visualizer_tests'")
     elseif(NOT BUILD_TESTS)
         message(STATUS "Format tests enabled. Build with 'ninja lichtfeld_format_tests' and run with 'ctest -L format'")
     else()
@@ -1364,7 +1248,6 @@ message(STATUS "  LibArchive Found: ${LibArchive_FOUND}")
 message(STATUS "  Build Type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  C++ Standard: ${CMAKE_CXX_STANDARD}")
 message(STATUS "  CUDA Standard: ${CMAKE_CUDA_STANDARD}")
-message(STATUS "  OpenImageIO Found: ${OpenImageIO_FOUND}")
 message(STATUS "  Tests: ${BUILD_TESTS}")
 message(STATUS "  Unicode Test Only: ${BUILD_UNICODE_TEST_ONLY}")
 message(STATUS "  Portable Build: ${BUILD_PORTABLE}")
@@ -1412,17 +1295,6 @@ install(TARGETS lfs_mcp
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
-if(_lfs_ort_runtime_libs)
-    if(WIN32)
-        set(_lfs_ort_install_dest "${CMAKE_INSTALL_BINDIR}")
-    else()
-        set(_lfs_ort_install_dest "${CMAKE_INSTALL_LIBDIR}")
-    endif()
-    install(FILES ${_lfs_ort_runtime_libs} DESTINATION ${_lfs_ort_install_dest})
-endif()
-if(WIN32 AND BUILD_PORTABLE AND _lfs_cudnn_runtime_libs)
-    install(FILES ${_lfs_cudnn_runtime_libs} DESTINATION ${CMAKE_INSTALL_BINDIR})
-endif()
 install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" DESTINATION ".")
 
 set(INSTALL_RESOURCE_DIR "${CMAKE_INSTALL_DATADIR}/LichtFeld-Studio")
@@ -1448,24 +1320,9 @@ install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/volinga-logo.png" D
 install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/assets/volinga-logo-dark.png" DESTINATION "${INSTALL_RESOURCE_DIR}/assets")
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/visualizer/gui/rmlui/resources/" DESTINATION "${INSTALL_RESOURCE_DIR}/assets/rmlui")
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/visualizer/gui/resources/locales" DESTINATION "${INSTALL_RESOURCE_DIR}")
+install(FILES "${CMAKE_SOURCE_DIR}/src/visualizer/gui/resources/locale_index.json"
+        DESTINATION "${INSTALL_RESOURCE_DIR}")
 install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/visualizer/gui/resources/viewer" DESTINATION "${INSTALL_RESOURCE_DIR}")
-
-# OpenUSD plugin resources (schema definitions + plugInfo.json files)
-# On Windows configure_usd_plugins() looks for <exe_dir>/usd → install next to the exe (bin/usd).
-# On Linux it looks for <exe_dir>/../lib/usd → install in lib/usd (unchanged).
-if(WIN32)
-    set(_USD_INSTALL_DEST "${CMAKE_INSTALL_BINDIR}/usd")
-else()
-    set(_USD_INSTALL_DEST "${CMAKE_INSTALL_LIBDIR}/usd")
-endif()
-if(EXISTS "${_USD_PLUGIN_SOURCE_DIR}")
-    install(DIRECTORY "${_USD_PLUGIN_SOURCE_DIR}/" DESTINATION "${_USD_INSTALL_DEST}"
-            PATTERN "__pycache__" EXCLUDE
-            PATTERN "*.pyc" EXCLUDE)
-endif()
-if(EXISTS "${_USD_ROOT_INDEX}")
-    install(FILES "${_USD_ROOT_INDEX}" DESTINATION "${_USD_INSTALL_DEST}")
-endif()
 
 # Plugin development documentation
 set(DOC_INSTALL_DIR "${CMAKE_INSTALL_DATADIR}/doc/LichtFeld-Studio")
@@ -1482,6 +1339,9 @@ if(TARGET nvimgcodec)
     install(TARGETS nvimgcodec
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        # Keep SDK headers out of the application's default runtime install.
+        PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+            COMPONENT Development EXCLUDE_FROM_ALL
     )
     if(TARGET nvjpeg_ext)
         install(TARGETS nvjpeg_ext
@@ -1535,9 +1395,6 @@ if(BUILD_PORTABLE)
             "${CMAKE_BINARY_DIR}/external/nvImageCodec"
             "${CUDAToolkit_BIN_DIR}"
             "${CUDAToolkit_LIBRARY_DIR}")
-    if(WIN32 AND _lfs_cudnn_bin_dir)
-        list(APPEND _RUNTIME_SEARCH_DIRS "${_lfs_cudnn_bin_dir}")
-    endif()
     if(DEFINED VCPKG_TARGET_TRIPLET)
         list(APPEND _RUNTIME_SEARCH_DIRS
                 "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin"
@@ -1581,9 +1438,6 @@ if(BUILD_PORTABLE)
     if(TARGET nvjpeg_ext)
         bundle_runtime_deps("$<TARGET_FILE:nvjpeg_ext>" TRUE)
     endif()
-    foreach(_lfs_ort_runtime_lib IN LISTS _lfs_ort_runtime_libs)
-        bundle_runtime_deps("${_lfs_ort_runtime_lib}" TRUE)
-    endforeach()
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         configure_file(

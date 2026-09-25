@@ -12,7 +12,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -36,6 +38,7 @@ namespace lfs::vis::gui {
 
     class RmlSystemInterface;
     class RmlTextInputHandler;
+    class SceneGraphElement;
     enum class RmlCursorRequest : uint8_t;
 
     struct CachedVulkanContextRender {
@@ -79,6 +82,14 @@ namespace lfs::vis::gui {
         RmlRect clip;
     };
 
+    struct RmlDragPayload {
+        std::uint64_t token = 0;
+        std::string type;
+        std::string data;
+        std::string label;
+        bool released = false;
+    };
+
     class RmlUIManager {
     public:
         LFS_VIS_API RmlUIManager();
@@ -96,6 +107,9 @@ namespace lfs::vis::gui {
         void destroyContext(const std::string& name);
 
         void ensureCjkFontsLoaded();
+        // Registers the system color emoji font as a fallback face once text
+        // above U+FFFF has been shown; the file is read off the UI thread.
+        void serviceEmojiFont();
 
         void setResizeDeferring(bool defer) { resize_deferring_ = defer; }
         [[nodiscard]] bool isResizeDeferring() const { return resize_deferring_; }
@@ -128,9 +142,9 @@ namespace lfs::vis::gui {
         void endVulkanFrame();
 
         LFS_VIS_API void beginFrameCursorTracking();
-        void trackContextFrame(const Rml::Context* context, int window_x, int window_y,
-                               std::optional<RmlRect> active_overlay = std::nullopt);
-        void setContextNeedsPassiveMouseMoveFrames(const Rml::Context* context, bool needs_frames);
+        LFS_VIS_API void trackContextFrame(const Rml::Context* context, int window_x, int window_y,
+                                           std::optional<RmlRect> active_overlay = std::nullopt);
+        LFS_VIS_API void setContextNeedsPassiveMouseMoveFrames(const Rml::Context* context, bool needs_frames);
         // Registers (or clears, on nullopt) the time a context's pending tooltip
         // is due to appear, so the idle loop can wake exactly at that moment.
         void setContextTooltipRevealDeadline(
@@ -140,7 +154,7 @@ namespace lfs::vis::gui {
         // or empty when none is counting down.
         [[nodiscard]] std::optional<double> secondsUntilTooltipReveal() const;
         RmlCursorRequest consumeCursorRequest();
-        [[nodiscard]] bool passiveMouseMoveNeedsRender(float window_x, float window_y) const;
+        [[nodiscard]] LFS_VIS_API bool passiveMouseMoveNeedsRender(float window_x, float window_y) const;
         [[nodiscard]] LFS_VIS_API bool activeOverlayContainsPoint(float window_x,
                                                                   float window_y) const;
         [[nodiscard]] bool activeOverlayOccludesContext(const Rml::Context* context,
@@ -153,6 +167,18 @@ namespace lfs::vis::gui {
         [[nodiscard]] bool wantsTextInput() const;
         [[nodiscard]] bool anyItemActive() const;
         bool refreshLocalizedDocuments();
+
+        LFS_VIS_API std::uint64_t beginDragPayload(std::string type,
+                                                   std::string data,
+                                                   std::string label = {});
+        LFS_VIS_API bool endDragPayload(std::uint64_t token);
+        LFS_VIS_API bool cancelDragPayload(std::uint64_t token);
+        LFS_VIS_API void cancelDragPayload();
+        void setActiveSceneGraphElement(SceneGraphElement* element) {
+            active_scene_graph_element_ = element;
+        }
+        [[nodiscard]] LFS_VIS_API std::optional<RmlDragPayload> dragPayload() const;
+        LFS_VIS_API std::optional<RmlDragPayload> takeReleasedDragPayload();
 
     private:
         struct VulkanContextCommand {
@@ -197,6 +223,9 @@ namespace lfs::vis::gui {
         std::vector<std::vector<std::byte>> font_blobs_;
         bool cjk_fonts_loaded_ = false;
         bool cjk_fonts_load_attempted_ = false;
+        std::future<std::vector<std::byte>> emoji_font_read_;
+        std::string emoji_font_path_;
+        bool emoji_font_settled_ = false;
         std::unordered_map<std::string, Rml::Context*> contexts_;
         std::unordered_map<const Rml::Context*, std::string> context_names_;
         std::unordered_map<const Rml::Context*, TrackedContextFrame> tracked_context_frames_;
@@ -215,6 +244,10 @@ namespace lfs::vis::gui {
         VkExtent2D vulkan_frame_extent_{};
         bool initialized_ = false;
         std::uint64_t tracked_context_order_ = 0;
+        mutable std::mutex drag_payload_mutex_;
+        std::optional<RmlDragPayload> drag_payload_;
+        std::uint64_t next_drag_payload_token_ = 1;
+        SceneGraphElement* active_scene_graph_element_ = nullptr;
     };
 
 } // namespace lfs::vis::gui

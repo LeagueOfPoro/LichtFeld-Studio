@@ -57,6 +57,7 @@ class TestOptimizationParams:
         assert isinstance(params.invert_masks, bool)
         assert isinstance(params.use_depth_loss, bool)
         assert isinstance(params.use_normal_loss, bool)
+        assert isinstance(params.normal_auto_generate, bool)
         assert isinstance(params.random, bool)
         assert isinstance(params.enable_sparsity, bool)
 
@@ -86,28 +87,40 @@ class TestOptimizationParams:
         params = lf.optimization_params()
 
         original_enabled = params.use_normal_loss
+        original_auto = params.normal_auto_generate
         original_weight = params.normal_loss_weight
         original_consistency = params.normal_consistency_weight
         original_flatten = params.normal_flatten_weight
+        original_start = params.normal_start_fraction
+        original_end = params.normal_end_fraction
         original_space = params.normal_loss_space
 
         try:
             params.use_normal_loss = True
+            params.normal_auto_generate = False
             params.normal_loss_weight = 0.75
             params.normal_consistency_weight = 0.25
             params.normal_flatten_weight = 5.0
+            params.normal_start_fraction = 0.3
+            params.normal_end_fraction = 0.9
             params.normal_loss_space = "world"
 
             assert params.use_normal_loss is True
+            assert params.normal_auto_generate is False
             assert params.normal_loss_weight == pytest.approx(0.75)
             assert params.normal_consistency_weight == pytest.approx(0.25)
             assert params.normal_flatten_weight == pytest.approx(5.0)
+            assert params.normal_start_fraction == pytest.approx(0.3)
+            assert params.normal_end_fraction == pytest.approx(0.9)
             assert params.normal_loss_space == "world"
         finally:
             params.use_normal_loss = original_enabled
+            params.normal_auto_generate = original_auto
             params.normal_loss_weight = original_weight
             params.normal_consistency_weight = original_consistency
             params.normal_flatten_weight = original_flatten
+            params.normal_start_fraction = original_start
+            params.normal_end_fraction = original_end
             params.normal_loss_space = original_space
 
     def test_get_string_property(self, lf):
@@ -132,6 +145,32 @@ class TestOptimizationParams:
             assert params.scaling_lr == pytest.approx(0.02)
         finally:
             params.set_strategy("mrnf")
+
+    def test_switching_to_igs_clears_stale_gut_from_its_preset(self, lf):
+        """A hidden GUT value must not survive re-entering the IGS+ preset."""
+        params = lf.optimization_params()
+        original_strategy = params.strategy
+        params.set_strategy("igs+")
+        original_igs_gut = params.gut
+        params.set_strategy("mrnf")
+        original_mrnf_gut = params.gut
+
+        try:
+            params.set_strategy("igs+")
+            params.gut = True
+            params.set_strategy("mrnf")
+            params.gut = False
+
+            params.set_strategy("igs+")
+
+            assert params.strategy == "igs+"
+            assert params.gut is False
+            assert params.validate() == ""
+        finally:
+            params.gut = original_igs_gut
+            params.set_strategy("mrnf")
+            params.gut = original_mrnf_gut
+            params.set_strategy(original_strategy)
 
     def test_properties_list(self, lf):
         """properties() should return list of property info dicts."""

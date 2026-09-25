@@ -3,6 +3,13 @@
 import utils;
 import spherical_harmonics;
 
+#define LFS_COLOR_INLINE
+#define LFS_COLOR_VEC3 float3
+#define LFS_COLOR_UINT uint
+#define LFS_COLOR_MIX lerp
+#include "display_color.inc"
+
+
 #ifndef LFS_3DGUT_PROJECTION
 #define LFS_3DGUT_PROJECTION 0
 #endif
@@ -71,9 +78,9 @@ Gaussian_3D load_gaussian_split(
     StructuredBuffer<float> xyz_ws,
     StructuredBuffer<float> sh0,
 #if LFS_SHN_F16
-    StructuredBuffer<uint2> shN,
+    uint64_t shN_address,
 #elif LFS_SHN_Q16
-    StructuredBuffer<uint> shN,
+    uint64_t shN_address,
     StructuredBuffer<float2> shN_bounds,
 #else
     StructuredBuffer<float4> shN,
@@ -88,12 +95,12 @@ Gaussian_3D load_gaussian_split(
     float3 g_xyz_ws = read_t3_float3(g_idx, xyz_ws);
 #if LFS_SHN_F16
     SpherHarmCoeffs g_sh_coeffs = read_spherical_harmonics_coeffs_split_f16(
-        g_idx, sh0, shN, active_sh, shN_layout_slots);
+        g_idx, sh0, shN_address, active_sh, shN_layout_slots);
 #elif LFS_SHN_Q16
     // shN_layout_slots carries n_cells (pad-dropped u16 cells per primitive)
     // on the q16 path (host sets uniforms.shN_layout_slots = n_cells).
     SpherHarmCoeffs g_sh_coeffs = read_spherical_harmonics_coeffs_split_q16(
-        g_idx, sh0, shN, shN_bounds, active_sh, shN_layout_slots);
+        g_idx, sh0, shN_address, shN_bounds, active_sh, shN_layout_slots);
 #else
     SpherHarmCoeffs g_sh_coeffs = read_spherical_harmonics_coeffs_split(
         g_idx, sh0, shN, active_sh, shN_layout_slots);
@@ -431,7 +438,8 @@ Splat_2D_Vertex project_gaussian_to_camera_model(
     uint model_transform_base,
     bool model_transform_enabled,
     bool mip_filter,
-    bool spark_rad_opacity_path) {
+    bool spark_rad_opacity_path,
+    bool standard_portal) {
     float3 xyz_vs = project_point(mean_ws, cam);
     // Reject behind-camera, non-finite, and far off-screen means. The EWA
     // projection Jacobian degenerates as the mean moves outside the frustum
@@ -439,7 +447,7 @@ Splat_2D_Vertex project_gaussian_to_camera_model(
     // CUDA reference uses clip_xy=1.4 (20% margin).
     if (xyz_vs.z <= NEAR_CLIP ||
         !isfinite(dot(xyz_vs, xyz_vs)) ||
-        !image_point_in_image_bounds_margin(xyz_vs.xy, cam, 0.2f)) {
+        (!standard_portal && !image_point_in_image_bounds_margin(xyz_vs.xy, cam, 0.2f))) {
         return { float3(0.0), float3(0.0), float3(0.0), float4(0.0), 0.0 };
     }
     xyz_vs.xy -= 0.5;  // pixel offset
@@ -459,9 +467,12 @@ Splat_2D_Vertex project_gaussian_to_camera_model(
     if (model_transform_enabled) {
         cov_ws = transform_covariance_rows(model_transform_rows, model_transform_base, cov_ws);
     }
-    float4 cov_vs = covariance_3d_to_2d(cam, mean_ws, cov_ws, mip_filter, spark_rad_opacity_path);
+    float4 cov_vs = standard_portal
+        ? covariance_3d_to_2d_portal(cam, mean_ws, cov_ws, mip_filter)
+        : covariance_3d_to_2d(cam, mean_ws, cov_ws, mip_filter, spark_rad_opacity_path);
     float opac = g.opacities * cov_vs.w;
-    float3 cov_projected = clamp_covariance_2d_extent(cov_vs.xyz, opac);
+    float3 cov_projected = standard_portal ? clamp_covariance_2d_portal(cov_vs.xyz, cam)
+                                         : clamp_covariance_2d_extent(cov_vs.xyz, opac);
     float det = compute_det(cov_projected);
     float3 inv_cov_vs = compute_inverse(cov_projected);
 
@@ -651,13 +662,13 @@ layout(binding=4) StructuredBuffer<uint2> scaling_raw;  // log f16x3 + pad
 layout(binding=5) StructuredBuffer<uint> opacity_raw;  // f16, 2 splats per uint
 #elif LFS_SHN_F16
 layout(binding=1) StructuredBuffer<float> sh0;  // 1*3 fp32 DC
-layout(binding=2) StructuredBuffer<uint2> shN;  // IEEE f16 float4-swizzle rest
+// shN is uniforms.shN_address (PhysicalStorageBuffer64); binding 2 is unused.
 layout(binding=3) StructuredBuffer<float4> rotations;  // 4
 layout(binding=4) StructuredBuffer<float> scaling_raw;  // 3
 layout(binding=5) StructuredBuffer<float> opacity_raw;  // 1
 #elif LFS_SHN_Q16
 layout(binding=1) StructuredBuffer<float> sh0;  // 1*3 fp32 DC
-layout(binding=2) StructuredBuffer<uint> shN;  // pad-dropped q16 (2×u16/word)
+// shN is uniforms.shN_address (PhysicalStorageBuffer64); binding 2 is unused.
 layout(binding=3) StructuredBuffer<float4> rotations;  // 4
 layout(binding=4) StructuredBuffer<float> scaling_raw;  // 3
 layout(binding=5) StructuredBuffer<float> opacity_raw;  // 1
@@ -671,9 +682,8 @@ layout(binding=5) StructuredBuffer<float> opacity_raw;  // 1
 
 // Output buffers
 #if !LFS_PROJECTION_SURVIVORS
-// The macro chain derives coverage from the rect + ellipse; tiles_touched and
-// radii are legacy-chain outputs only and their bindings are absent in the
-// survivor variant.
+// The macro chain derives coverage from the rect + ellipse; tiles_touched is
+// a legacy-chain output only. Binding 8 (write-only radii) was retired.
 layout(binding=6) RWStructuredBuffer<int> out_tiles_touched;
 #endif
 #if USE_EMULATED_INT64
@@ -681,14 +691,11 @@ layout(binding=7) RWStructuredBuffer<int32_t> out_rect_tile_space;
 #else
 layout(binding=7) RWStructuredBuffer<int64_t> out_rect_tile_space;
 #endif
-#if !LFS_PROJECTION_SURVIVORS
-layout(binding=8) RWStructuredBuffer<int> out_radii;
-#endif
 layout(binding=9) RWStructuredBuffer<float2> out_xy_vs;
 layout(binding=10) RWStructuredBuffer<float> out_depths;
 layout(binding=11) RWStructuredBuffer<float4> out_inv_cov_vs;
 layout(binding=12) RWStructuredBuffer<float> out_rgb;
-layout(binding=13) RWStructuredBuffer<uint> out_overlay_flags;
+layout(binding=13) RWByteAddressBuffer out_overlay_flags;
 layout(binding=14) ByteAddressBuffer transform_indices;
 layout(binding=15) ByteAddressBuffer node_mask;
 layout(binding=16) StructuredBuffer<float4> overlay_params;
@@ -744,9 +751,8 @@ layout(binding=24) StructuredBuffer<float2> shN_bounds;
 // Legacy N-wide variant only: the survivor-list variant never clears, because
 // rejected splats simply do not append a compact slot.
 [ForceInline]
-void clear_forward_projection_output(uint out_idx, uint overlay_flags) {
-    out_overlay_flags[out_idx] = overlay_flags;
-    out_radii[out_idx] = 0;
+void clear_forward_projection_output(uint out_idx, uint overlay_flags, uint lod_enabled) {
+    write_overlay_byte(out_overlay_flags, out_idx, overlay_flags, lod_enabled);
     out_tiles_touched[out_idx] = 0;
   #if USE_EMULATED_INT64
     out_rect_tile_space[2*out_idx+0] = 0;
@@ -798,7 +804,7 @@ void main(
     uint3 dispatchThreadID : SV_DispatchThreadID,
     uniform Uniforms uniforms
 ) {
-    const uint active_sh = uniforms.active_sh;
+    uint active_sh = uniforms.active_sh;
     const uint model_transform_count = uniforms.step;
     const uint image_height = uniforms.image_height;
     const uint image_width = uniforms.image_width;
@@ -835,7 +841,7 @@ void main(
         if ((uniforms.lod_enabled & 32u) != 0u) {
             const uint valid = min(lod_counts[0], uniforms.lod_count);
             if (render_idx >= valid) {
-                clear_forward_projection_output(out_idx, 0u);
+                clear_forward_projection_output(out_idx, 0u, uniforms.lod_enabled);
                 return;
             }
         }
@@ -843,7 +849,7 @@ void main(
         g_idx = lod_indices[render_idx];
         if (g_idx == 0xffffffffu || g_idx >= uniforms.model_num_splats) {
           #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD && !LFS_PROJECTION_SURVIVORS
-            clear_forward_projection_output(out_idx, 0u);
+            clear_forward_projection_output(out_idx, 0u, uniforms.lod_enabled);
           #endif
             return;
         }
@@ -893,7 +899,15 @@ void main(
       );
     #elif LFS_SHN_Q16
     Gaussian_3D gauss = load_gaussian_split(
-        g_idx, xyz_ws, sh0, shN, shN_bounds, rotations,
+        g_idx, xyz_ws, sh0, uniforms.shN_address, shN_bounds, rotations,
+        scaling_raw, opacity_raw,
+        uniforms.lod_enabled,
+        active_sh,
+        uniforms.shN_layout_slots
+      );
+    #elif LFS_SHN_F16
+    Gaussian_3D gauss = load_gaussian_split(
+        g_idx, xyz_ws, sh0, uniforms.shN_address, rotations,
         scaling_raw, opacity_raw,
         uniforms.lod_enabled,
         active_sh,
@@ -931,13 +945,21 @@ void main(
     uint overlay_flags = active_state.overlay_flags;
     uint model_transform_base = active_state.model_transform_base;
     bool model_transform_enabled = active_state.model_transform_enabled;
+    // Coefficients retain their full storage layout. The fourth transform row
+    // carries a per-node evaluation cap, avoiding loss of inactive source SH.
+    if (model_transform_enabled) {
+        float node_sh_code = model_transforms[model_transform_base + 3u].x;
+        if (node_sh_code >= 1.0f && node_sh_code <= 4.0f) {
+            active_sh = min(active_sh, uint(node_sh_code) - 1u);
+        }
+    }
     float3 mean_ws = active_state.mean_ws;
 
     if (!active_state.active) {
       #if LFS_PROJECTION_SURVIVORS
         return;
       #else
-        clear_forward_projection_output(out_idx, overlay_flags);
+        clear_forward_projection_output(out_idx, overlay_flags, uniforms.lod_enabled);
         return;
       #endif
     }
@@ -945,31 +967,63 @@ void main(
 
     const bool spark_rad_opacity_path = (uniforms.lod_enabled & 4u) != 0u;
 
+#if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
+    if (uniforms.splat_render_profile == 1u && !spark_rad_opacity_path) {
+        gauss.rotations = lfsPortalCompactRotation(gauss.rotations);
+        gauss.scales = lfsPortalCompactScales(gauss.scales);
+        gauss.opacities = lfsPortalCompactOpacity(gauss.opacities);
+    }
+#endif
+
     // projection (differentiable)
   #if EXPORT_MODE != EXPORT_MODE_VULKAN_BACKWARD
     // forward
+    // Project in the source viewport's pixel units so fixed dilation and the
+    // 512-pixel covariance cap do not shrink splats in high-resolution exports.
+    // Rescale the footprint before binning into the full-resolution tile grid.
+    const float rasterization_scale = uniforms.rasterization_scale > 0.0f
+        ? uniforms.rasterization_scale : 1.0f;
+    Camera projection_cam = cam;
+    if (rasterization_scale != 1.0f) {
+        projection_cam.fx /= rasterization_scale;
+        projection_cam.fy /= rasterization_scale;
+        projection_cam.cx /= rasterization_scale;
+        projection_cam.cy /= rasterization_scale;
+        projection_cam.W = max(1, int(round(float(cam.W) / rasterization_scale)));
+        projection_cam.H = max(1, int(round(float(cam.H) / rasterization_scale)));
+    }
   #if LFS_3DGUT_PROJECTION
     Splat_2D_Vertex splat = project_gaussian_to_camera_gut(
         gauss,
-        cam,
+        projection_cam,
         active_sh,
         mean_ws,
         model_transforms,
         model_transform_base,
         model_transform_enabled,
-        (uniforms.mip_filter & 1u) != 0u);
+        // Portal GUT keeps its 0.3 dilation and raw opacity when AA is enabled.
+        (uniforms.mip_filter & 1u) != 0u &&
+            (uniforms.splat_render_profile != 1u || spark_rad_opacity_path));
   #else
     Splat_2D_Vertex splat = project_gaussian_to_camera_model(
         gauss,
-        cam,
+        projection_cam,
         active_sh,
         mean_ws,
         model_transforms,
         model_transform_base,
         model_transform_enabled,
         (uniforms.mip_filter & 1u) != 0u,
-        spark_rad_opacity_path);
+        spark_rad_opacity_path,
+        uniforms.splat_render_profile == 1u && !spark_rad_opacity_path);
   #endif
+    if (rasterization_scale != 1.0f) {
+        const float variance_scale = rasterization_scale * rasterization_scale;
+        splat.xyz_vs.xy = (splat.xyz_vs.xy + 0.5f) * rasterization_scale - 0.5f;
+        splat.cov_vs *= variance_scale;
+        splat.inv_cov_vs_opac.xyz /= variance_scale;
+        splat.det *= variance_scale * variance_scale;
+    }
   #else
     // backward
     float2 v_out_xy_vs = is_zero_grad ? float2(0) : v_output_xy_vs[g_idx];
@@ -993,19 +1047,35 @@ void main(
 
     // radii, bounds, number of tiles
 #if EXPORT_MODE != EXPORT_MODE_VULKAN_BACKWARD
-    splat.xyz_vs.xy -= float2(uniforms.render_origin_x, uniforms.render_origin_y);
+    if (!full_frame_binning(uniforms)) {
+        splat.xyz_vs.xy -= float2(uniforms.render_origin_x, uniforms.render_origin_y);
+    }
 
+    float opacity_threshold = ALPHA_THRESHOLD;
+#if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
+    if (uniforms.splat_render_profile == 1u && !spark_rad_opacity_path)
+        opacity_threshold = 1.0f / 255.0f;
+#endif
     if (splat.xyz_vs.z <= NEAR_CLIP ||
-        splat.inv_cov_vs_opac.w <= ALPHA_THRESHOLD ||
+        splat.inv_cov_vs_opac.w <= opacity_threshold ||
         splat.det <= 0.0
     ) {
         #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD && !LFS_PROJECTION_SURVIVORS
-            clear_forward_projection_output(out_idx, overlay_flags);
+            clear_forward_projection_output(out_idx, overlay_flags, uniforms.lod_enabled);
         #endif
         return;
     }
 
     Splat_2D_Vertex splat_dist = splat;
+#if LFS_3DGUT_PROJECTION && EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
+    if (uniforms.splat_render_profile == 1u && !spark_rad_opacity_path) {
+        // An ellipse with twice the billboard covariance contains its four
+        // corners. Keep the raw covariance for the exact fragment bound.
+        splat_dist.inv_cov_vs_opac.xyz = portal_gut_bin_inverse(splat.inv_cov_vs_opac.xyz, cam.W, cam.H);
+        splat_dist.cov_vs = compute_inverse(splat_dist.inv_cov_vs_opac.xyz);
+        splat_dist.det = compute_det(splat_dist.cov_vs);
+    }
+#endif
 
     float radius = splat_radius(splat_dist.cov_vs.xyz, splat_dist.det);
     bool equirectangular_camera = is_equirectangular_camera(cam);
@@ -1021,14 +1091,20 @@ void main(
         radii.y = min(radii.y, 0.49f * float(image_height));
     }
 
+    // GUT keeps a local tile grid, but crops the full-image rectangle only
+    // after choosing its ellipse scan axis. Both count and emission use it.
+    const bool banded_gut = full_frame_binning(uniforms) && is_gut_projection_mode(uniforms.camera_model);
+    const uint bin_grid_width = banded_gut ? (camera_width + TILE_WIDTH - 1u) / TILE_WIDTH : grid_width;
+    const uint bin_grid_height = banded_gut ? (camera_height + TILE_HEIGHT - 1u) / TILE_HEIGHT : grid_height;
     rectangle rect_tile_space = equirectangular_camera
         ? get_wrapped_rectangle_tile_space(splat_dist.xyz_vs.xy, radii, grid_height, grid_width)
-        : get_rectangle_tile_space(splat_dist.xyz_vs.xy, radii, grid_height, grid_width);
+        : get_rectangle_tile_space(splat_dist.xyz_vs.xy, radii, bin_grid_height, bin_grid_width);
+    const rectangle render_rect = banded_gut ? clip_to_render_grid(rect_tile_space, uniforms) : rect_tile_space;
 
-    int32_t n_tiles = int32_t(rect_tile_space.max_x - rect_tile_space.min_x) * int32_t(rect_tile_space.max_y - rect_tile_space.min_y);
+    int32_t n_tiles = int32_t(render_rect.max_x - render_rect.min_x) * int32_t(render_rect.max_y - render_rect.min_y);
     if (n_tiles == 0) {
         #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD && !LFS_PROJECTION_SURVIVORS
-            clear_forward_projection_output(out_idx, overlay_flags);
+            clear_forward_projection_output(out_idx, overlay_flags, uniforms.lod_enabled);
         #endif
         return;
     }
@@ -1037,7 +1113,8 @@ void main(
     if (!equirectangular_camera) {
         n_tiles = no_diff count_ellipse_grid_overlaps(
             splat_dist.xyz_vs.xy, splat_dist.inv_cov_vs_opac.xyz/(extend*extend),
-            rect_tile_space
+            render_rect,
+            rect_tile_space.max_y - rect_tile_space.min_y <= rect_tile_space.max_x - rect_tile_space.min_x
         );
     }
   #endif
@@ -1078,8 +1155,6 @@ void main(
     out_sort_ids[out_idx] = int32_t(out_idx);
     out_orig_ids[out_idx] = int32_t(logical_idx);
 #else
-    // out_radii[g_idx] = (uint32_t)radius;  // inria
-    out_radii[out_idx] = (uint32_t)ceil(max(radii.x, radii.y));  // gsplat, only used in densification
     out_tiles_touched[out_idx] = n_tiles;
   #if USE_EMULATED_INT64
     out_rect_tile_space[2*out_idx+0] = (int32_t)rect_tile_space.min_x | ((int32_t)rect_tile_space.min_y << 16);
@@ -1089,7 +1164,7 @@ void main(
   #endif
 
     if (n_tiles == 0) {
-        out_overlay_flags[out_idx] = overlay_flags;
+        write_overlay_byte(out_overlay_flags, out_idx, overlay_flags, uniforms.lod_enabled);
         return;
     }
 
@@ -1117,8 +1192,14 @@ void main(
     out_xy_vs[out_idx] = splat.xyz_vs.xy;
     out_depths[out_idx] = splat.xyz_vs.z;
     out_inv_cov_vs[out_idx] = splat.inv_cov_vs_opac;
+    if (uniforms.splat_render_profile == 1u && !spark_rad_opacity_path) {
+        splat.rgb = lfsPortalCompactColor(splat.rgb);
+    }
+    if (uniforms.splat_render_profile == 1u && uniforms.color_tonemapping != 0u) {
+        splat.rgb = lfsDisplaySplat(splat.rgb, uniforms.color_tonemapping, uniforms.color_exposure);
+    }
     write_t3_float3(splat.rgb, out_idx, out_rgb);
-    out_overlay_flags[out_idx] = overlay_flags;
+    write_overlay_byte(out_overlay_flags, out_idx, overlay_flags, uniforms.lod_enabled);
 
 #elif EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
 

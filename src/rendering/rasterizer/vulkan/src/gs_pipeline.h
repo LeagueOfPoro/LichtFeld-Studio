@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <limits>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -21,6 +23,10 @@
 #include "buffer.h"
 #include "rendering/vulkan_result.hpp"
 #include "rendering/vulkan_wait.hpp"
+
+// Read generated VkSplat shader blobs ahead of renderer construction. The
+// cache is process-local and also serves the normal loadSpirv path.
+void preloadSpirvFiles(const std::vector<std::string>& paths);
 
 class VulkanGSPipeline {
 public:
@@ -104,6 +110,7 @@ public:
     bool writeTimestampNoExcept(int delta);
     void addTimerCallback(TimerCallback callback);
     void setCpuTimerCallback(CpuTimerCallback callback);
+    void setBandedExport(bool enabled);
 
     size_t getCurrentAllocSize() const { return current_vram; }
     size_t getPeakAllocSize() const { return peak_vram; }
@@ -245,6 +252,7 @@ protected:
         uint32_t maxGroupsX;
         uint32_t maxGroupsY;
         uint32_t maxGroupsZ;
+        VkDeviceSize maxStorageBufferRange = std::numeric_limits<VkDeviceSize>::max();
     } deviceInfo;
 
     // Compute pipeline. Storage-buffer bindings are pushed via
@@ -257,6 +265,9 @@ protected:
         VkPipeline pipeline;
         std::vector<int> buffer_layouts;
         std::string diagnostic_name;
+        std::string spirv_path;
+        bool compatible_subgroup_size = true;
+        uint32_t expected_workgroup_size_x = 0;
 
         _ComputePipeline(
             std::vector<int> buffer_layouts) : shader(VK_NULL_HANDLE),
@@ -285,6 +296,10 @@ protected:
     };
 
     std::vector<_ComputePipeline*> all_compute_pipelines;
+    std::vector<_ComputePipeline*> pending_compute_pipelines;
+    std::vector<std::pair<_ComputePipeline*, std::unique_ptr<_ComputePipeline>>> banded_export_pipelines_;
+    bool banded_export_initialized_ = false;
+    bool banded_export_active_ = false;
 
     uint32_t queue_family_index;
 
@@ -313,7 +328,11 @@ protected:
     }
 
     void createComputeDescriptorSetLayout(_ComputePipeline& pipeline);
-    void createComputePipeline(_ComputePipeline& pipeline, const std::string& spirv_path, bool compatible_subgroup_size = true);
+    void createComputePipeline(_ComputePipeline& pipeline,
+                               const std::string& spirv_path,
+                               bool compatible_subgroup_size = true,
+                               uint32_t expected_workgroup_size_x = 0);
+    void createPendingComputePipelines();
     void executeCompute(
         std::vector<std::pair<size_t, size_t>> dims,
         const void* uniformsPtr, size_t uniformSize,

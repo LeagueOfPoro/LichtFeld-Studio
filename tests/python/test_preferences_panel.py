@@ -4,11 +4,30 @@
 
 from enum import IntEnum
 from importlib import import_module
+import json
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import sys
 
 import pytest
+
+
+def test_project_folder_remove_label_uses_sentence_case_in_all_locales():
+    expected = {
+        "de": "Ordner entfernen",
+        "en": "Remove folder",
+        "es": "Quitar carpeta",
+        "fr": "Retirer le dossier",
+        "it": "Rimuovi cartella",
+        "ja": "フォルダーを外す",
+        "ko": "폴더 제거",
+        "nl": "Map verwijderen",
+        "pl": "Usuń folder",
+        "zh": "移除文件夹",
+    }
+    locales = Path(__file__).resolve().parents[2] / "src/visualizer/gui/resources/locales"
+    assert {path.stem: json.loads(path.read_text())["projects"]["action.remove_folder"]
+            for path in locales.glob("*.json")} == expected
 
 
 @pytest.fixture
@@ -50,6 +69,7 @@ def preferences_panel_module(monkeypatch):
             "safe_mode": False,
         },
         set_mcp_calls=[],
+        clipboard_text="",
         file_associations=[],
         file_association_set_calls=[],
         panel_enabled_calls=[],
@@ -59,15 +79,27 @@ def preferences_panel_module(monkeypatch):
             scene_upscaler_preset="native",
         ),
         scene_reconstruction_presets={"native": "native", "spatial": "quality"},
-        working_directory="",
+        viewport_chrome_style="translucent",
+        set_viewport_chrome_style_calls=[],
+        viewport_toolbar_position="centered",
+        set_viewport_toolbar_position_calls=[],
+        zoom_speed=11.0,
+        navigation_speed=8.0,
+        project_location="",
+        embed_dataset_by_default=False,
+        project_manager_preferences={
+            "defaultView": "remember",
+            "openAtStartup": True,
+            "rememberState": True,
+        },
     )
 
-    def set_working_directory(path):
-        state.working_directory = str(path)
+    def set_project_location(path):
+        state.project_location = str(path)
         return ""
 
-    def clear_working_directory():
-        state.working_directory = ""
+    def clear_project_location():
+        state.project_location = ""
 
     def set_mcp_preferences(enabled, expose_network, port, request_logging):
         config = {
@@ -95,6 +127,17 @@ def preferences_panel_module(monkeypatch):
     def reset_scene_reconstruction_preferences():
         state.scene_reconstruction_presets = {"native": "native", "spatial": "quality"}
 
+    def set_viewport_chrome_style(style):
+        state.viewport_chrome_style = str(style)
+        state.set_viewport_chrome_style_calls.append(str(style))
+
+    def set_viewport_toolbar_position(position):
+        state.viewport_toolbar_position = str(position)
+        state.set_viewport_toolbar_position_calls.append(str(position))
+
+    def set_speed(name, value):
+        setattr(state, name, max(1.0, min(100.0, float(value))))
+
     lf_stub = ModuleType("lichtfeld")
     lf_stub.ui = SimpleNamespace(
         PanelSpace=SimpleNamespace(FLOATING="FLOATING"),
@@ -102,15 +145,25 @@ def preferences_panel_module(monkeypatch):
         PanelOption=SimpleNamespace(DEFAULT_CLOSED="DEFAULT_CLOSED"),
         get_current_language=lambda: state.language,
         set_language=lambda language: state.set_language_calls.append(language),
+        get_theme=lambda: "dark",
+        get_theme_family=lambda: "lichtfeld",
+        get_theme_mode=lambda: "dark",
+        get_ui_scale_preference=lambda: 0.0,
+        set_ui_scale=lambda *_a, **_k: None,
         get_mcp_preferences=lambda: dict(state.mcp_preferences),
+        get_mcp_access_token=lambda: "test-token",
+        set_clipboard_text=lambda text: setattr(state, "clipboard_text", text),
         set_mcp_preferences=set_mcp_preferences,
         get_mcp_status=lambda: dict(state.mcp_status),
-        get_working_directory=lambda: state.working_directory or "/home/tester/.lichtfeld",
-        get_working_directory_preference=lambda: state.working_directory,
-        get_default_working_directory=lambda: "/home/tester/.lichtfeld",
-        get_temp_project_directory=lambda: (state.working_directory or "/home/tester/.lichtfeld") + "/tmp",
-        set_working_directory=set_working_directory,
-        clear_working_directory=clear_working_directory,
+        get_project_location=lambda: state.project_location or "/home/tester/.lichtfeld/projects",
+        get_project_location_preference=lambda: state.project_location,
+        get_default_project_location=lambda: "/home/tester/.lichtfeld/projects",
+        get_embed_dataset_by_default=lambda: state.embed_dataset_by_default,
+        set_project_location=set_project_location,
+        clear_project_location=clear_project_location,
+        set_embed_dataset_by_default=lambda enabled: setattr(
+            state, "embed_dataset_by_default", bool(enabled)
+        ),
         open_folder_dialog=lambda title, start: "",
         set_panel_enabled=lambda panel_id, enabled: state.panel_enabled_calls.append(
             (panel_id, bool(enabled))
@@ -156,6 +209,20 @@ def preferences_panel_module(monkeypatch):
         ),
         set_scene_reconstruction=set_scene_reconstruction,
         reset_scene_reconstruction_preferences=reset_scene_reconstruction_preferences,
+        get_progress_bar_style=lambda: "classic",
+        set_progress_bar_style=lambda *_a, **_k: None,
+        get_viewport_chrome_style=lambda: state.viewport_chrome_style,
+        set_viewport_chrome_style=set_viewport_chrome_style,
+        get_viewport_toolbar_position=lambda: state.viewport_toolbar_position,
+        set_viewport_toolbar_position=set_viewport_toolbar_position,
+        get_zoom_speed_preference=lambda: state.zoom_speed,
+        set_zoom_speed_preference=lambda value: set_speed("zoom_speed", value),
+        get_navigation_speed_preference=lambda: state.navigation_speed,
+        set_navigation_speed_preference=lambda value: set_speed("navigation_speed", value),
+        remember_camera_navigation=lambda: False,
+        set_remember_camera_navigation=lambda _enabled: None,
+        remember_camera_view_snap=lambda: False,
+        set_remember_camera_view_snap=lambda _enabled: None,
     )
     lf_stub.keymap = SimpleNamespace(
         ToolMode=IntEnum(
@@ -249,6 +316,15 @@ def preferences_panel_module(monkeypatch):
             DELETE_SELECTED=SimpleNamespace(name="DELETE_SELECTED", value=73),
             BRUSH_RESIZE=SimpleNamespace(name="BRUSH_RESIZE", value=74),
             DELETE_NODE=SimpleNamespace(name="DELETE_NODE", value=75),
+            SELECT_ALL_SCENE_NODES=SimpleNamespace(
+                name="SELECT_ALL_SCENE_NODES", value=82
+            ),
+            TOGGLE_SCENE_SELECTION_VISIBILITY=SimpleNamespace(
+                name="TOGGLE_SCENE_SELECTION_VISIBILITY", value=83
+            ),
+            TOGGLE_SCENE_SELECTION_TRAINING=SimpleNamespace(
+                name="TOGGLE_SCENE_SELECTION_TRAINING", value=84
+            ),
         ),
         get_available_profiles=lambda: ["Default"],
         get_current_profile=lambda: "Default",
@@ -285,7 +361,9 @@ def preferences_panel_module(monkeypatch):
 
     lf_stub.get_render_settings = lambda: state.render_settings
     lf_stub.get_camera_navigation_mode = lambda: "orbit"
+    lf_stub.set_camera_navigation_mode = lambda _mode: None
     lf_stub.get_camera_view_snap_enabled = lambda: False
+    lf_stub.set_camera_view_snap_enabled = lambda _enabled: None
     lf_stub.file_associations_status = file_associations_status
     lf_stub.file_association_set = file_association_set
 
@@ -294,6 +372,25 @@ def preferences_panel_module(monkeypatch):
     sys.modules.pop("lfs_plugins.keymap_bindings", None)
     sys.modules.pop("lfs_plugins", None)
     module = import_module("lfs_plugins.preferences_panel")
+    monkeypatch.setattr(
+        module,
+        "read_project_manager_preferences",
+        lambda: dict(state.project_manager_preferences),
+    )
+    monkeypatch.setattr(
+        module,
+        "set_project_manager_preference",
+        lambda key, value: state.project_manager_preferences.__setitem__(key, value),
+    )
+    monkeypatch.setattr(
+        module,
+        "reset_project_manager_preferences",
+        lambda: setattr(
+            state,
+            "project_manager_preferences",
+            {"defaultView": "remember", "openAtStartup": True, "rememberState": True},
+        ),
+    )
     return module, state
 
 
@@ -305,6 +402,207 @@ def test_language_selection_does_not_reload_active_language(preferences_panel_mo
     panel._set_language_index("1")
 
     assert state.set_language_calls == []
+
+
+def test_project_manager_preferences_round_trip_and_reset(preferences_panel_module):
+    module, state = preferences_panel_module
+    panel = module.PreferencesPanel()
+
+    panel._set_project_manager_default_view("gallery")
+    panel._set_project_manager_open_at_startup(False)
+    panel._set_project_manager_remember_state(False)
+
+    assert state.project_manager_preferences == {
+        "defaultView": "gallery",
+        "openAtStartup": False,
+        "rememberState": False,
+    }
+
+    panel._reset_section("general")
+
+    assert state.project_manager_preferences == {
+        "defaultView": "remember",
+        "openAtStartup": True,
+        "rememberState": True,
+    }
+
+
+def test_project_folders_preferences_add_remove_and_protect_default(preferences_panel_module, monkeypatch):
+    module, _state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    records = {}
+    panel._handle = SimpleNamespace(
+        update_record_list=lambda name, rows: records.__setitem__(name, rows),
+        dirty=lambda _name: None,
+    )
+    folders = {"default": {"name": "Projects", "path": "/tmp/projects"}}
+    calls = []
+    backend = SimpleNamespace(
+        _asset_index=object(),
+        _asset_index_folders=lambda: folders,
+        _add_folder_from_path=lambda path, recursive: calls.append((path, recursive)) or folders.__setitem__("extra", {"name": "Extra", "path": path}),
+        on_delete_folder=lambda _h, _e, args: calls.append(("remove", args[0])),
+        refresh_catalog=lambda **kwargs: calls.append(("rescan", kwargs)),
+    )
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _id: backend, raising=False)
+    monkeypatch.setattr(module.lf.ui, "open_folder_dialog", lambda *_: "/tmp/extra")
+    monkeypatch.setattr(module.lf.ui, "confirm_dialog", lambda _title, _message, buttons, callback: callback(buttons[1]), raising=False)
+
+    panel._refresh_project_folders()
+    assert records["project_folders"][0]["id"] == "default"
+    assert records["project_folders"][0]["can_remove"] is False
+    panel._on_add_project_folder()
+    assert calls == [("/tmp/extra", True)]
+    panel._on_remove_project_folder(args=["default"])
+    assert len(calls) == 1
+    panel._on_remove_project_folder(args=["extra"])
+    panel._on_rescan_project_folders()
+    assert calls[-2:] == [("remove", "extra"), ("rescan", {"scan_folders": True})]
+
+
+def test_portal_section_does_not_offer_settings_reset(preferences_panel_module, monkeypatch):
+    module, _state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    panel._section = "portal"
+    dialogs = []
+    monkeypatch.setattr(module.lf.ui, "confirm_dialog", lambda *args: dialogs.append(args), raising=False)
+    panel._on_reset_current_section(None, None, None)
+
+    assert dialogs == []
+    assert panel._show_section_reset() is False
+
+
+def test_preferences_portal_status_uses_shared_connection_state(preferences_panel_module, monkeypatch):
+    module, _state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    translations = {
+        "portal.status.connect": "Connect to Portal",
+        "portal.status.turn_on": "Turn on Portal",
+        "portal.status.busy": "Portal: Working…",
+        "portal.status.switched_off": "Portal connected, switched off",
+        "portal.status.disconnected": "Portal: Not connected",
+        "portal.status.connected_as": "Portal connected as {name}",
+    }
+    monkeypatch.setattr(module.lf.ui, "tr", lambda key: translations.get(key, key), raising=False)
+    snapshots = (
+        (SimpleNamespace(signed_in=False, authorized=False, linking=False, disconnecting=False,
+                         display_name=""), "Portal: Not connected"),
+        (SimpleNamespace(signed_in=False, authorized=True, linking=False, disconnecting=False,
+                         display_name=""), "Portal connected, switched off"),
+        (SimpleNamespace(signed_in=False, authorized=False, linking=True, disconnecting=False,
+                         display_name=""), "Portal: Working…"),
+        (SimpleNamespace(signed_in=True, authorized=True, linking=False, disconnecting=False,
+                         display_name="A Long Display Name"), "Portal connected as A Long Display Name"),
+    )
+    for snapshot, expected in snapshots:
+        monkeypatch.setattr(panel, "_portal_connection_snapshot", lambda snapshot=snapshot: snapshot)
+        assert panel._portal_connection_status() == expected
+
+
+def test_viewport_chrome_selection_uses_global_style_preference(preferences_panel_module):
+    module, state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    panel._refresh_selection = lambda: None
+
+    assert panel._viewport_chrome_index() == "1"
+    panel._set_viewport_chrome_index("2")
+
+    assert state.viewport_chrome_style == "frosted"
+    assert state.set_viewport_chrome_style_calls == ["frosted"]
+    assert panel._viewport_chrome_index() == "2"
+
+
+def test_viewport_toolbar_position_uses_global_preference(preferences_panel_module):
+    module, state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    panel._refresh_selection = lambda: None
+
+    assert panel._viewport_toolbar_position_index() == "1"
+    panel._set_viewport_toolbar_position_index("2")
+
+    assert state.viewport_toolbar_position == "free"
+    assert state.set_viewport_toolbar_position_calls == ["free"]
+    assert panel._viewport_toolbar_position_index() == "2"
+
+
+def test_navigation_speed_preferences_round_trip_and_clamp(preferences_panel_module):
+    module, state = preferences_panel_module
+    panel = module.PreferencesPanel()
+
+    panel._set_zoom_speed(42)
+    panel._set_navigation_speed(73)
+    assert panel._get_scrub_value("zoom_speed") == 42
+    assert panel._get_scrub_value("navigation_speed") == 73
+
+    panel._set_zoom_speed(0)
+    panel._set_navigation_speed(101)
+    assert state.zoom_speed == 1
+    assert state.navigation_speed == 100
+
+
+def test_navigation_speed_preferences_reset_with_input_section(preferences_panel_module):
+    module, state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    panel._section = "input"
+    panel._set_zoom_speed(42)
+    panel._set_navigation_speed(73)
+    panel._refresh_selection = lambda: None
+
+    panel._reset_section()
+
+    assert state.zoom_speed == 11
+    assert state.navigation_speed == 8
+
+
+def test_project_location_is_saved_and_can_return_to_default(
+    preferences_panel_module,
+):
+    module, state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    panel._read_project_location()
+
+    assert panel._project_location == "/home/tester/.lichtfeld/projects"
+
+    panel._set_project_location_draft("/mnt/projects")
+    assert panel._commit_project_location() is True
+    assert state.project_location == "/mnt/projects"
+    assert panel._applied_project_location == "/mnt/projects"
+
+    panel._on_use_default_project_location(None, None, None)
+    assert state.project_location == ""
+    assert panel._project_location == "/home/tester/.lichtfeld/projects"
+
+
+def test_general_preferences_expose_project_location_controls():
+    project_root = Path(__file__).parent.parent.parent
+    rml = (
+        project_root
+        / "src"
+        / "visualizer"
+        / "gui"
+        / "rmlui"
+        / "resources"
+        / "preferences.rml"
+    ).read_text(encoding="utf-8")
+
+    assert 'data-event-click="toggle_section(\'project_location\')"' in rml
+    assert 'data-value="project_location"' in rml
+    assert 'data-event-click="browse_project_location"' in rml
+    assert 'data-event-click="use_default_project_location"' in rml
+
+
+def test_project_manager_uses_a_standard_section_and_uniform_control_width():
+    project_root = Path(__file__).parent.parent.parent
+    resources = project_root / "src" / "visualizer" / "gui" / "rmlui" / "resources"
+    rml = (resources / "preferences.rml").read_text(encoding="utf-8")
+    rcss = (resources / "preferences.rcss").read_text(encoding="utf-8")
+
+    assert 'data-event-click="toggle_section(\'project_manager\')"' in rml
+    assert 'data-if="project_manager_expanded"' in rml
+    assert "preferences-subheading" not in rml
+    select_rule = rcss.split(".preferences-select {", 1)[1].split("}", 1)[0]
+    assert "box-sizing: border-box;" in select_rule
+    assert "width: 200dp;" in select_rule
 
 
 def test_scene_reconstruction_uses_backend_specific_presets(preferences_panel_module):
@@ -392,6 +690,16 @@ def test_mcp_port_is_drafted_until_explicit_confirmation(preferences_panel_modul
             "request_logging": False,
         }
     ]
+
+
+def test_mcp_access_token_copy_uses_displayed_value(preferences_panel_module):
+    module, state = preferences_panel_module
+    panel = module.PreferencesPanel()
+
+    assert panel._mcp_token_text() == "test-token"
+    panel._on_copy_mcp_token(None, None, None)
+
+    assert state.clipboard_text == "test-token"
 
 
 def test_invalid_mcp_port_blocks_application(preferences_panel_module):
@@ -634,7 +942,7 @@ def test_safe_mode_disables_preferences_and_status_bar_mcp_controls():
     preferences = (resources / "preferences.rml").read_text(encoding="utf-8")
     status_bar = (resources / "statusbar.rml").read_text(encoding="utf-8")
 
-    assert preferences.count('data-attrif-disabled="mcp_safe_mode"') == 7
+    assert preferences.count('data-attrif-disabled="mcp_safe_mode"') == 8
     assert preferences.count('data-class-disabled="mcp_safe_mode"') == 2
     assert (
         '<button id="mcp-toggle" data-class-is-on="mcp_server_enabled" '
@@ -768,3 +1076,56 @@ def test_file_associations_rows_toggle_calls_set(preferences_panel_module):
 
     assert state.file_association_set_calls == [(".ply", True)]
     assert [row["registered"] for row in records["file_associations"]] == [True, True]
+
+
+def test_embed_dataset_default_is_exposed_and_settable(preferences_panel_module):
+    module, state = preferences_panel_module
+    panel = module.PreferencesPanel()
+
+    assert module.lf.ui.get_embed_dataset_by_default() is False
+    panel._set_embed_dataset_by_default(True)
+    assert state.embed_dataset_by_default is True
+    assert module.lf.ui.get_embed_dataset_by_default() is True
+
+
+def test_preferences_close_retains_the_mounted_document(preferences_panel_module):
+    module, state = preferences_panel_module
+    panel = module.PreferencesPanel()
+
+    class Document:
+        def get_element_by_id(self, _element_id):
+            return None
+
+    document = Document()
+    panel._rebuild_records = lambda: None
+    panel._load_mcp_preferences = lambda: None
+    panel._consume_section_request = lambda: None
+    panel._refresh_selection = lambda: None
+    panel._state = lambda: None
+    panel._dirty_expanded_sections = lambda: None
+    panel._keymap.on_mount = lambda _doc: None
+    panel.on_mount(document)
+    panel._on_close(None, None, None)
+
+    assert panel.mount_count == 1
+    assert panel._document is document
+    assert state.panel_enabled_calls[-1] == ("lfs.preferences", False)
+
+
+def test_preferences_keymap_rows_are_created_when_expanded(preferences_panel_module):
+    module, _state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    records = {}
+    panel._keymap._handle = SimpleNamespace(
+        update_record_list=lambda name, items: records.__setitem__(name, list(items)),
+    )
+    panel._section = "input"
+
+    assert "key_bindings" in panel._expanded_sections
+    assert panel._keymap._rows_built is False
+
+    panel._expanded_sections.discard("key_bindings")
+    panel._on_toggle_section(None, None, ["key_bindings"])
+
+    assert panel._keymap._rows_built is True
+    assert records["binding_rows"]

@@ -6,13 +6,16 @@
 
 #include "core/error.hpp"
 #include "core/export.hpp"
+#include "io/project_chapters.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -99,6 +102,7 @@ namespace lfs::vis {
     struct LFS_VIS_API ProjectMenuInfo {
         bool reopen_last_project = true;
         bool auto_save_on_close = false;
+        bool embed_dataset_by_default = false;
         std::uint64_t autosave_interval_seconds = 5 * 60;
         std::vector<ProjectRecentInfo> recent_projects;
     };
@@ -111,9 +115,21 @@ namespace lfs::vis {
         std::optional<lfs::ErrorCode> error_code;
     };
 
+    // Lightweight snapshot for persistent application chrome. Unlike
+    // ProjectInfo, this deliberately avoids payload and storage inspection so
+    // it is safe to refresh while the window is interactive.
+    struct LFS_VIS_API ProjectDisplayInfo {
+        std::optional<std::filesystem::path> path;
+        std::optional<std::string> title;
+        bool dirty = false;
+
+        friend bool operator==(const ProjectDisplayInfo&, const ProjectDisplayInfo&) = default;
+    };
+
     struct LFS_VIS_API ProjectInfo {
         std::optional<std::filesystem::path> path;
         std::string project_uuid;
+        std::string license_identifier;
         std::uint64_t generation = 0;
         bool dirty = false;
         bool session_dirty = false;
@@ -123,6 +139,10 @@ namespace lfs::vis {
         bool contains_embedded_secrets = false;
         bool reopen_last_project = true;
         bool auto_save_on_close = false;
+        bool embed_dataset_by_default = false;
+        bool dataset_external_available = false;
+        bool embedded_dataset_complete = false;
+        std::uint64_t embedded_dataset_entries = 0;
         std::uint64_t autosave_interval_seconds =
             5 * 60;
         std::uint64_t autosave_dirty_epoch_threshold =
@@ -186,9 +206,16 @@ namespace lfs::vis {
         virtual RenderingManager* getRenderingManager() = 0;
 
         virtual bool postWork(WorkItem work) = 0;
+        // Drain viewer-owned work while an explicit project operation waits
+        // for a worker. Normal frames drain this queue from update().
+        virtual bool pumpPostedWorkForProjectWrite() { return false; }
         [[nodiscard]] virtual bool isOnViewerThread() const { return false; }
         [[nodiscard]] virtual bool acceptsPostedWork() const { return true; }
         virtual void setShutdownRequestedCallback(std::function<void()> callback) = 0;
+        virtual void set_evaluation_weights_preparer(
+            std::function<std::optional<std::filesystem::path>(bool allow_download)> preparer) {
+            static_cast<void>(preparer);
+        }
         virtual std::expected<void, std::string> startTraining() = 0;
         [[nodiscard]] virtual std::optional<int>
         trainingStartOverwriteConflict() {
@@ -199,6 +226,12 @@ namespace lfs::vis {
         virtual lfs::Result<void>
         projectSaveAs(const std::filesystem::path& path,
                       bool regenerate_preview = true) = 0;
+        virtual lfs::Result<void>
+        projectCreateAt(
+            const std::filesystem::path& path,
+            ProjectSwitchDisposition disposition =
+                ProjectSwitchDisposition::RequireClean,
+            bool allow_existing_destination_replacement = false) = 0;
         virtual lfs::Result<ProjectOpenOutcome>
         projectOpen(
             const std::filesystem::path& path,
@@ -206,12 +239,33 @@ namespace lfs::vis {
                 ProjectSwitchDisposition::RequireClean) = 0;
         virtual lfs::Result<void>
         projectCompact() = 0;
+        virtual lfs::Result<void>
+        projectEmbedDataset() {
+            return {};
+        }
         virtual lfs::Result<bool>
         projectIsDirty() = 0;
         virtual lfs::Result<bool>
         projectHasPath() = 0;
         virtual lfs::Result<ProjectInfo>
         projectGetInfo() = 0;
+        virtual ProjectDisplayInfo projectGetDisplayInfo() { return {}; }
+        virtual lfs::Result<std::optional<lfs::io::project::ProjectLicense>>
+        projectGetLicense() = 0;
+        virtual lfs::Result<void>
+        projectSetLicense(const lfs::io::project::ProjectLicense& license) = 0;
+        virtual lfs::Result<void>
+        projectClearLicense() = 0;
+        virtual lfs::Result<void>
+        projectSetPreview(
+            std::span<const std::byte> png_bytes,
+            const std::filesystem::path& expected_path = {},
+            std::string expected_project_uuid = {}) {
+            static_cast<void>(png_bytes);
+            static_cast<void>(expected_path);
+            static_cast<void>(expected_project_uuid);
+            return {};
+        }
         virtual lfs::Result<ProjectWritePoll>
         projectPollWrite() {
             return ProjectWritePoll{};
@@ -219,6 +273,15 @@ namespace lfs::vis {
         // True when the last ProjectSave or ProjectSaveAs command
         // started a write. A cancelled save dialog returns false.
         [[nodiscard]] virtual bool consumeProjectSaveStarted() {
+            return false;
+        }
+        // True only when the last ProjectCreate command bound a new project.
+        // Confirmation prompts and deferred stop/create are not success.
+        [[nodiscard]] virtual bool consumeProjectCreateSucceeded() {
+            return false;
+        }
+        // True while a stop-then-create is queued and has not bound yet.
+        [[nodiscard]] virtual bool projectCreatePending() const {
             return false;
         }
         virtual void projectWaitWrite() {}
@@ -233,6 +296,8 @@ namespace lfs::vis {
                     info->reopen_last_project,
                 .auto_save_on_close =
                     info->auto_save_on_close,
+                .embed_dataset_by_default =
+                    info->embed_dataset_by_default,
                 .autosave_interval_seconds =
                     info->autosave_interval_seconds,
                 .recent_projects =
@@ -258,6 +323,27 @@ namespace lfs::vis {
             (void)replace;
             (void)discard_changes;
             return false;
+        }
+
+        struct ProjectTrainingSessionState {
+            bool available = false;
+            int iteration = 0;
+            int max_iterations = 0;
+            std::string strategy;
+            bool completed = false;
+            bool hydrated = false;
+            bool restoring = false;
+            std::string error;
+        };
+
+        [[nodiscard]] virtual ProjectTrainingSessionState
+        projectTrainingSessionState() const {
+            return {};
+        }
+        virtual lfs::Result<void>
+        restoreProjectTrainingSession(bool then_start = false) {
+            (void)then_start;
+            return {};
         }
 
         virtual ~Visualizer() = default;

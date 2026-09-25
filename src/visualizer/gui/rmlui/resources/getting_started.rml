@@ -11,6 +11,14 @@
   <p class="description">@tr:getting_started.description</p>
 
   <div class="video-grid">
+    <div class="video-card" id="card-overview"
+         data-url="https://www.youtube.com/watch?v=i-04z4_eqiU"
+         data-event-click="open_url">
+      <div class="card-body">
+        <span class="play-icon">&#x25B6;</span>
+      </div>
+      <span class="card-title">@tr:getting_started.video_overview</span>
+    </div>
     <div class="video-card" id="card-automotive"
          data-url="https://www.youtube.com/watch?v=FqYTKeI5K6I"
          data-event-click="open_url">
@@ -26,14 +34,6 @@
         <span class="play-icon">&#x25B6;</span>
       </div>
       <span class="card-title">@tr:getting_started.video_intro</span>
-    </div>
-    <div class="video-card" id="card-latest"
-         data-url="https://www.youtube.com/watch?v=zWIzBHRc-60"
-         data-event-click="open_url">
-      <div class="card-body">
-        <span class="play-icon">&#x25B6;</span>
-      </div>
-      <span class="card-title">@tr:getting_started.video_latest</span>
     </div>
     <div class="video-card" id="card-masks"
          data-url="https://www.youtube.com/watch?v=956qR8N3Xk4"
@@ -58,14 +58,6 @@
         <span class="play-icon">&#x25B6;</span>
       </div>
       <span class="card-title">@tr:getting_started.video_colmap</span>
-    </div>
-    <div class="video-card" id="card-lichtfeld"
-         data-url="https://www.youtube.com/watch?v=aX8MTlr9Ypc"
-         data-event-click="open_url">
-      <div class="card-body">
-        <span class="play-icon">&#x25B6;</span>
-      </div>
-      <span class="card-title">@tr:getting_started.video_lichtfeld</span>
     </div>
   </div>
 

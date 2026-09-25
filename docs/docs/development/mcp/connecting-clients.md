@@ -13,8 +13,11 @@ http://127.0.0.1:45677/mcp
 
 The transport is plain HTTP JSON-RPC. The default loopback binding is reachable
 only from the same computer. Preferences can explicitly expose the endpoint on
-the local network; that mode has no authentication or TLS and must only be used
-on a trusted network. The port, listener state, usable endpoints, and optional
+the local network; network clients must send `Authorization: Bearer <token>`.
+The token is available with a copy button in MCP Preferences and is stored in
+the user configuration directory. Network traffic is plain HTTP, so use a trusted
+network or a protected tunnel. Local clients without a browser Origin can connect
+without a token. Requests must use `Content-Type: application/json`. The port, listener state, usable endpoints, and optional
 request logging are also managed from Preferences or the MCP status-bar chip.
 
 ## Choose a Connection Path
@@ -34,6 +37,9 @@ claude mcp add --transport http lichtfeld http://127.0.0.1:45677/mcp
 ```
 
 No proxy process, no extra runtime. The only requirement is that the app is running before the client connects.
+For a network endpoint, configure the client to send the bearer token shown in
+MCP Preferences. The repository bridge accepts `LFS_MCP_TOKEN` when pointed at
+a network endpoint with `LFS_MCP_ENDPOINT`.
 
 ## Claude Desktop
 
@@ -100,6 +106,19 @@ the server may be disabled, configured on another port, or unable to bind
 because another process already owns the port. The displayed endpoint list
 contains client-ready URLs; `0.0.0.0` is only the listener bind address and is
 not presented as a client endpoint.
+
+## Running Two Instances
+
+The MCP port is a saved preference (default `45677`) shared by every launch of
+the same install. A second instance fails to bind and shows "MCP Error" in the
+status bar. To isolate a second instance for this launch only, start it with
+`--mcp-port=45678`. The saved preference is not changed.
+
+Before mutating anything, check `serverInfo.version` from the `initialize`
+response. It is the build's git-describe string (for example
+`v0.5.3-361-g59682b11`) and identifies the binary that answered. Two instances
+of the same binary return the same value, so when in doubt use a distinct
+`--mcp-port` per instance instead of sharing the default port.
 
 ## Runtime Controls and Diagnostics
 

@@ -6,9 +6,10 @@
 
 #include "gui/panel_registry.hpp"
 
+#include <string_view>
+
 namespace lfs::vis::gui {
 
-    class StartupOverlay;
     class GizmoManager;
     class GuiManager;
     class SequencerUIManager;
@@ -22,6 +23,8 @@ namespace lfs::gui {
 }
 
 namespace lfs::vis::gui::native_panels {
+
+    inline constexpr std::string_view SEQUENCER_PANEL_ID = "native.sequencer";
 
     class VideoExtractorPanel : public IPanel {
     public:
@@ -46,17 +49,6 @@ namespace lfs::vis::gui::native_panels {
         void setForcedHeight(float h);
         void setPanelSpace(PanelSpace space);
         lfs::gui::IVideoExtractorWidget* widget_;
-    };
-
-    class StartupOverlayPanel : public IPanel {
-    public:
-        StartupOverlayPanel(StartupOverlay* overlay, const bool* drag_hovering);
-        void draw(const PanelDrawContext& ctx) override;
-        bool poll(const PanelDrawContext& ctx) override;
-
-    private:
-        StartupOverlay* overlay_;
-        const bool* drag_hovering_;
     };
 
     class SelectionOverlayPanel : public IPanel {

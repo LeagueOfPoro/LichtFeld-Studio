@@ -23,6 +23,73 @@ namespace {
     using namespace lfs::io::project;
     using namespace lfs::test::licht;
 
+    TEST(ProjectChapterTest, LicenseRoundTripsAndOmitsEmptyNotice) {
+        ProjectChapter chapter;
+        ASSERT_TRUE(chapter.set_license(ProjectLicense{
+            .identifier = "CC BY-NC",
+            .notice = "Copyright 2026",
+        }));
+
+        auto license = chapter.license();
+        ASSERT_TRUE(license);
+        ASSERT_TRUE(license->has_value());
+        EXPECT_EQ(*license, (ProjectLicense{
+                                .identifier = "CC BY-NC",
+                                .notice = "Copyright 2026",
+                            }));
+
+        ASSERT_TRUE(chapter.set_license(ProjectLicense{
+            .identifier = "CC BY-NC",
+        }));
+        license = chapter.license();
+        ASSERT_TRUE(license);
+        ASSERT_TRUE(license->has_value());
+        EXPECT_TRUE((*license)->notice.empty());
+        EXPECT_FALSE(chapter.dom().get_json("license.notice"));
+
+        ASSERT_TRUE(chapter.clear_license());
+        license = chapter.license();
+        ASSERT_TRUE(license);
+        EXPECT_FALSE(license->has_value());
+        EXPECT_FALSE(chapter.dom().get_json("license"));
+
+        const auto rejected = chapter.set_license(ProjectLicense{});
+        ASSERT_FALSE(rejected);
+        EXPECT_EQ(rejected.error().code(), lfs::ErrorCode::InvalidArgument);
+    }
+
+    TEST(SogLicenseTest, NormativeVectors) {
+        const std::string v1 =
+            "Title: Example scene.\n"
+            "Author: Example Author (https://example.invalid/user/example)\n"
+            "Source: https://example.invalid/scene/0001\n"
+            "License: CC Attribution (Creative Commons Attribution)\n"
+            "License URL: http://creativecommons.org/licenses/by/4.0/\n"
+            "Requirements: Author must be credited. Commercial use is allowed.";
+        const auto map = [](std::string_view input) {
+            return map_sog_license(std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(input.data()), input.size()));
+        };
+        EXPECT_EQ(map(v1), (ProjectLicense{
+                               "CC-BY-4.0",
+                               v1 + "\nCredit: Example Author (https://example.invalid/user/example)"}));
+        EXPECT_EQ(map("License: CC BY-NC-SA\r\nLicense URL: https://CreativeCommons.org/licenses/by-nc-sa/3.0/\r\n"),
+                  (ProjectLicense{"CC-BY-NC-SA-3.0",
+                                  "License: CC BY-NC-SA\nLicense URL: https://CreativeCommons.org/licenses/by-nc-sa/3.0/"}));
+        const std::string v3 = "Author: Someone\nLicense URL: https://creativecommons.org/publicdomain/zero/1.0/";
+        EXPECT_EQ(map(v3), (ProjectLicense{"CC0-1.0", v3}));
+        EXPECT_EQ(map("Author: Someone\nLicense: All Rights Reserved"),
+                  (ProjectLicense{"LicenseRef-AllRightsReserved",
+                                  "Author: Someone\nLicense: All Rights Reserved\nCredit: Someone"}));
+        EXPECT_EQ(map("\xef\xbb\xbfSome custom terms.\r\nNo reuse.\n\n"),
+                  (ProjectLicense{"LicenseRef-Custom", "Some custom terms.\nNo reuse."}));
+        EXPECT_FALSE(map(""));
+        EXPECT_FALSE(map("  \n\t "));
+        EXPECT_FALSE(map(std::string_view("\xff\xfe\x00", 3)));
+        const std::string v7 = "License URL: https://creativecommons.org/licenses/by/1.0/\nLicense: Old CC";
+        EXPECT_EQ(map(v7), (ProjectLicense{"LicenseRef-OldCC", v7}));
+    }
+
     ParameterManagerSnapshot parameter_snapshot() {
         ParameterManagerSnapshot result;
         result.active_strategy = "mrnf";
@@ -742,6 +809,48 @@ namespace {
         EXPECT_FALSE((*found)->training_enabled);
         ASSERT_TRUE((*found)->camera);
         EXPECT_TRUE((*found)->camera->has_image);
+    }
+
+    // Headless training from an untrained .licht has no checkpoint to restore
+    // from, so the run is assembled from the PRMS snapshot and the command
+    // line. This pins the three merge rules: stored values (active strategy,
+    // its iterations, loading settings) replace the CLI defaults; the process
+    // flags describe this launch and stay with the CLI; and flags the user
+    // typed explicitly, recorded as overrides, beat the stored values. The
+    // resolved dataset location and the CLI output location must survive
+    // because PRMS never stores paths.
+    TEST(ProjectChapterTest, AdoptProjectTrainingParametersMergesSnapshotAndCliFlags) {
+        using lfs::core::param::OptimizationParameters;
+        ParameterManagerSnapshot snapshot;
+        snapshot.active_strategy = "mcmc";
+        snapshot.mcmc_current = OptimizationParameters::mcmc_defaults();
+        snapshot.mcmc_current.iterations = 1234;
+        snapshot.dataset.images = "images_4";
+        snapshot.dataset.test_every = 8;
+        snapshot.dataset.loading_params.use_cpu_memory = false;
+
+        // As parsed from: --headless -o out --images images --test-every 4
+        lfs::core::param::TrainingParameters params;
+        params.optimization.headless = true;
+        params.dataset.output_path = "out";
+        params.dataset.output_path_explicit = true;
+        params.overrides.dataset_json = R"({"images":"images","test_every":4})";
+
+        adopt_project_training_parameters(params, snapshot, "/data/scene", "images_4");
+
+        // Stored strategy, iterations and loading settings win over CLI defaults.
+        EXPECT_EQ(params.optimization.strategy, "mcmc");
+        EXPECT_EQ(params.optimization.iterations, 1234u);
+        EXPECT_FALSE(params.dataset.loading_params.use_cpu_memory);
+        // Process flags stay with the command line.
+        EXPECT_TRUE(params.optimization.headless);
+        // Explicit CLI dataset flags win over stored values.
+        EXPECT_EQ(params.dataset.images, "images");
+        EXPECT_EQ(params.dataset.test_every, 4);
+        // Resolved dataset location and CLI output location are kept.
+        EXPECT_EQ(params.dataset.data_path, std::filesystem::path("/data/scene"));
+        EXPECT_EQ(params.dataset.output_path, std::filesystem::path("out"));
+        EXPECT_TRUE(params.dataset.output_path_explicit);
     }
 
 } // namespace

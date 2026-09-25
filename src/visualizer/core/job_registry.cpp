@@ -112,7 +112,9 @@ namespace lfs::vis {
     void JobRegistry::finishWork(
         const JobHandle handle, const bool canceled,
         std::string error,
-        const std::optional<lfs::ErrorCode> error_code) {
+        const std::optional<lfs::ErrorCode> error_code,
+        std::optional<lfs::Error> typed_error,
+        const bool published) {
         assert(
             std::this_thread::get_id() != main_thread_ &&
             "JobRegistry::finishWork must run on a worker thread");
@@ -123,12 +125,16 @@ namespace lfs::vis {
              entry->status != JobStatus::Running)) {
             return;
         }
+        // Cancellation is cooperative. A durable publication cannot be undone
+        // by a request that arrived after the worker's final cancellation gate.
+        assert(!published || error.empty());
         entry->worker_canceled =
-            canceled || entry->cancel_requested;
+            !published && (canceled || entry->cancel_requested);
         if (!error.empty()) {
             entry->error = std::move(error);
         }
         entry->error_code = error_code;
+        entry->typed_error = std::move(typed_error);
         entry->status = JobStatus::CompletionPending;
     }
 
@@ -152,6 +158,7 @@ namespace lfs::vis {
             .stage = entry->stage,
             .error = entry->error,
             .error_code = entry->error_code,
+            .typed_error = entry->typed_error,
             .cancel_requested =
                 entry->cancel_requested,
             .worker_canceled =
@@ -269,6 +276,7 @@ namespace lfs::vis {
             .stage = entry->stage,
             .error = entry->error,
             .error_code = entry->error_code,
+            .typed_error = entry->typed_error,
             .cancel_requested = entry->cancel_requested,
             .worker_canceled = entry->worker_canceled,
         };
