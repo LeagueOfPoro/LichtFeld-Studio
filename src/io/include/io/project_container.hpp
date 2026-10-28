@@ -89,6 +89,7 @@ namespace lfs::io::project {
     inline constexpr Fourcc FOURCC_SPLT = make_fourcc('S', 'P', 'L', 'T');
     inline constexpr Fourcc FOURCC_PCLD = make_fourcc('P', 'C', 'L', 'D');
     inline constexpr Fourcc FOURCC_MESH = make_fourcc('M', 'E', 'S', 'H');
+    inline constexpr Fourcc FOURCC_COLV = make_fourcc('C', 'O', 'L', 'V');
     inline constexpr Fourcc FOURCC_CKPT = make_fourcc('C', 'K', 'P', 'T');
     inline constexpr Fourcc FOURCC_PPIS = make_fourcc('P', 'P', 'I', 'S');
     inline constexpr Fourcc FOURCC_GUIL = make_fourcc('G', 'U', 'I', 'L');
@@ -98,6 +99,7 @@ namespace lfs::io::project {
     inline constexpr Fourcc FOURCC_METR = make_fourcc('M', 'E', 'T', 'R');
     inline constexpr Fourcc FOURCC_THMB = make_fourcc('T', 'H', 'M', 'B');
     inline constexpr Fourcc FOURCC_DSRC = make_fourcc('D', 'S', 'R', 'C');
+    inline constexpr Fourcc FOURCC_SFMO = make_fourcc('S', 'F', 'M', 'O');
 
     struct ChunkKey {
         Fourcc fourcc;
@@ -147,6 +149,10 @@ namespace lfs::io::project {
         // plain CHUNK_ZSTD_V1; readers without this bit refuse the generation.
         CHUNK_BYTESHUFFLE_ZSTD_V1 = 8,
         ENCODED_SCENE_ASSETS = 9,
+        // Scene nodes reference an external 3D Tiles tileset (REFS, source kind
+        // "tiles3d"); readers without it report an unsupported feature.
+        TILESET_REFERENCES = 10,
+        COLLISION_VOLUMES_V1 = 11,
     };
 
     [[nodiscard]] LFS_IO_API CapabilitySet supported_reader_capabilities();
@@ -270,6 +276,12 @@ namespace lfs::io::project {
         std::uint32_t commit_crc32c_echo = 0;
         std::optional<PreviewLocator> preview = std::nullopt;
         std::uint32_t head_crc32c = 0;
+    };
+
+    struct ProjectHeadIdentity {
+        lfs::core::Uuid project_uuid;
+        lfs::core::Uuid commit_uuid;
+        std::uint64_t generation = 0;
     };
 
     struct BlockCrcTable {
@@ -407,6 +419,10 @@ namespace lfs::io::project {
                         const ReaderOptions& options = {});
         [[nodiscard]] static OpenClassification
         classify(const std::filesystem::path& path, const ReaderOptions& options = {});
+        // Identity of the newest head with a valid checksum, read from the superblock and the head slots only.
+        // The commit it names is not validated; a full open can still select an older head.
+        [[nodiscard]] static lfs::Result<ProjectHeadIdentity>
+        read_head_identity(const std::filesystem::path& path);
 
         ProjectReader(ProjectReader&&) noexcept;
         ProjectReader& operator=(ProjectReader&&) noexcept;
@@ -414,6 +430,9 @@ namespace lfs::io::project {
         ProjectReader& operator=(const ProjectReader&) = delete;
         ~ProjectReader();
 
+        // Retain the already validated commit and native file handle; never reopen by path.
+        [[nodiscard]] ProjectReader share() const { return ProjectReader(impl_); }
+        [[nodiscard]] lfs::Result<void> validate_source_identity() const;
         [[nodiscard]] const std::filesystem::path& path() const noexcept;
         [[nodiscard]] std::uint64_t physical_file_size() const noexcept;
         [[nodiscard]] OpenState open_state() const noexcept;

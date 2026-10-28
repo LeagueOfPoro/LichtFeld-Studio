@@ -12,6 +12,33 @@ enum class DensificationType : int { None = 0,
                                      MCMC = 1,
                                      MRNF = 2 };
 
+namespace fast_lfs::rasterization {
+    // dL/dalpha of the background blend (output = color + (1 - alpha) * bg).
+    // A precomputed map wins; otherwise the blend backward derives it per pixel
+    // from the image gradient and the background (CHW image, else solid color)
+    // and adds the optional extra alpha gradient.
+    struct BackgroundAlphaGradient {
+        const float* grad_alpha_map = nullptr;
+        const float* bg_color = nullptr;
+        const float* bg_image = nullptr;
+        const float* grad_alpha_extra = nullptr;
+    };
+
+    // Per-view SteadySplats Eq. 7 loss. Its target is each pixel's expected
+    // splat color, which the blend backward derives from the forward image,
+    // its final transmittance and the background, so the forward image must
+    // still hold the raw render. The caller zeros loss_out; the blend adds
+    // weighted loss. Background contributes to the photometric adjoint only.
+    // Pixels are averaged uniformly, or with pixel_weight (e.g. the crop box ROI)
+    // as weight * w_p / sum(w), the weighted mean the photometric loss uses.
+    struct ColorVarianceLoss {
+        float weight = 0.0f;
+        const float* pixel_weight = nullptr;
+        const float* pixel_weight_sum = nullptr; // device scalar, required with pixel_weight
+        float* loss_out = nullptr;
+    };
+} // namespace fast_lfs::rasterization
+
 namespace fast_lfs::rasterization::config {
     // rendering constants
     DEF float dilation = 0.3f;            // Standard dilation when mip_filter OFF

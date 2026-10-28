@@ -3,12 +3,14 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include "core/path_utils.hpp"
 #include "io/project_chapters.hpp"
 #include "licht_test_support.hpp"
 
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <filesystem>
 #include <format>
@@ -488,6 +490,46 @@ namespace {
                 .background_image_reference->to_string());
     }
 
+    // Catches a stored preset becoming unreadable once its evaluation mask file is moved or deleted,
+    // as when the project is opened on another machine.
+    TEST(ProjectChapterTest, PresetWithAMissingEvaluationMaskStaysReadable) {
+        TemporaryDirectory temporary;
+        const auto missing = lfs::core::param::normalize_eval_mask(
+            lfs::core::path_to_utf8(temporary.path / "moved_mask.obj"));
+        auto snapshot = parameter_snapshot();
+        snapshot.mcmc_current.enable_eval = true;
+        snapshot.mcmc_current.eval_mask = missing;
+
+        ParametersChapter chapter;
+        ASSERT_TRUE(chapter.set_snapshot(snapshot));
+        auto reparsed = ParametersChapter::from_bytes(chapter.to_bytes());
+        ASSERT_TRUE(reparsed) << lfs::format_for_developer(reparsed.error());
+        const auto restored = reparsed->snapshot();
+        ASSERT_TRUE(restored) << lfs::format_for_developer(restored.error());
+        EXPECT_EQ(restored->mcmc_current.eval_mask, missing);
+    }
+
+    // Catches a project saved by another version becoming unreadable because one stored value is
+    // outside what this version accepts, here an automatic learning rate stored as -1.
+    TEST(ProjectChapterTest, PresetFromAnotherVersionKeepsAcceptedValuesAndDefaultsTheRest) {
+        auto snapshot = parameter_snapshot();
+        snapshot.mrnf_session.iterations = 12345;
+        ParametersChapter chapter;
+        ASSERT_TRUE(chapter.set_snapshot(snapshot));
+        ASSERT_TRUE(chapter.dom().set_json("presets.mrnf.session.shs_lr", -1.0));
+        ASSERT_TRUE(chapter.dom().set_json("presets.mrnf.session.grow_fraction", -1.0));
+        ASSERT_TRUE(chapter.dom().set_json("presets.mrnf.session.late_lr_anneal", 0.3));
+
+        auto reparsed = ParametersChapter::from_bytes(chapter.to_bytes());
+        ASSERT_TRUE(reparsed) << lfs::format_for_developer(reparsed.error());
+        const auto restored = reparsed->snapshot();
+        ASSERT_TRUE(restored) << lfs::format_for_developer(restored.error());
+        const auto defaults = lfs::core::param::OptimizationParameters::mrnf_defaults();
+        EXPECT_EQ(restored->mrnf_session.iterations, 12345u);
+        EXPECT_FLOAT_EQ(restored->mrnf_session.shs_lr, defaults.shs_lr);
+        EXPECT_FLOAT_EQ(restored->mrnf_session.grow_fraction, defaults.grow_fraction);
+    }
+
     TEST(ProjectChapterTest, PathReferenceMintAndResolveRoundTrip) {
         TemporaryDirectory temporary;
         const fs::path project_root = temporary.path / "project";
@@ -554,6 +596,39 @@ namespace {
             EXPECT_EQ(row.locator.base, LocatorBase::Project);
             EXPECT_FALSE(row.unresolved);
         }
+    }
+
+    TEST(ProjectChapterTest, SiblingDatasetReferenceSurvivesProjectFolderMove) {
+        TemporaryDirectory temporary;
+        const fs::path origin = temporary.path / "origin";
+        const fs::path project_root = origin / "saved";
+        const fs::path dataset = origin / "dataset";
+        fs::create_directories(project_root);
+        fs::create_directories(dataset / "images");
+        {
+            std::ofstream image(dataset / "images" / "frame.bin", std::ios::binary);
+            image << "image-bytes";
+        }
+
+        ReferencesChapter references;
+        auto dataset_uuid = upsert_path_reference(
+            references, project_root, dataset, "dataset", "dataset");
+        ASSERT_TRUE(dataset_uuid)
+            << lfs::format_for_developer(dataset_uuid.error());
+
+        auto rows = references.records();
+        ASSERT_TRUE(rows);
+        ASSERT_EQ(rows->size(), 1u);
+        EXPECT_EQ(rows->front().locator.base, LocatorBase::Project);
+        EXPECT_EQ(rows->front().locator.preferred, "../dataset");
+
+        const fs::path relocated = temporary.path / "relocated";
+        fs::rename(origin, relocated);
+        const auto resolved = resolve_path_reference(
+            references, relocated / "saved", *dataset_uuid);
+        ASSERT_TRUE(resolved);
+        EXPECT_EQ(resolved->lexically_normal(),
+                  (relocated / "dataset").lexically_normal());
     }
 
     TEST(ProjectChapterTest, SceneGraphBatchedUpsertRetainsUnknownNodeMembers) {
@@ -778,6 +853,86 @@ namespace {
         EXPECT_FALSE((*nodes)[2].camera->has_image);
     }
 
+    TEST(ProjectChapterTest, SceneGraphPointCloudSourceRoundTripsAndDefaultsFalse) {
+        const auto id = uuid_literal("53000000-0000-4000-8000-000000000011");
+        SceneGraphChapter chapter;
+        ASSERT_TRUE(chapter.upsert_node(SceneNodeRecord{
+            .uuid = id,
+            .type = "splat",
+            .name = "Raw points",
+            .point_cloud_source = true,
+        }));
+        auto parsed = SceneGraphChapter::parse(chapter.dom().dump());
+        ASSERT_TRUE(parsed);
+        auto found = parsed->find(id);
+        ASSERT_TRUE(found && *found);
+        EXPECT_TRUE((*found)->point_cloud_source);
+        auto legacy = lfs::io::JsonChapterDom::Json::parse(chapter.dom().dump());
+        legacy["nodes"][0].erase("point_cloud_source");
+        auto old = SceneGraphChapter::parse(legacy.dump());
+        ASSERT_TRUE(old);
+        auto old_found = old->find(id);
+        ASSERT_TRUE(old_found && *old_found);
+        EXPECT_FALSE((*old_found)->point_cloud_source);
+        auto cleared = SceneNodeRecord{.uuid = id, .type = "splat", .name = "Ordinary splat"};
+        ASSERT_TRUE(chapter.upsert_node(cleared));
+        auto without_hint = lfs::io::JsonChapterDom::Json::parse(chapter.dom().dump());
+        EXPECT_FALSE(without_hint["nodes"][0].contains("point_cloud_source"));
+        legacy["nodes"][0]["point_cloud_source"] = "invalid";
+        auto invalid = SceneGraphChapter::parse(legacy.dump());
+        ASSERT_FALSE(invalid);
+        EXPECT_EQ(invalid.error().code(), lfs::ErrorCode::DataLoss);
+    }
+
+    TEST(ProjectChapterTest, SceneGraphCropPolygonRoundTripsAndRejectsMalformedOutlines) {
+        const auto id = uuid_literal("53000000-0000-4000-8000-000000000012");
+        const CropPolygonRecord polygon{
+            .vertices = {{-2.0f, -1.0f}, {2.0f, -1.0f}, {2.0f, 0.5f}, {0.0f, 1.0f}, {-2.0f, 0.5f}},
+            .half_depth = 1.25f,
+            .inverse = true,
+            .enabled = false,
+            .color = {0.1f, 0.2f, 0.3f},
+            .line_width = 3.0f,
+        };
+        SceneGraphChapter chapter;
+        ASSERT_TRUE(chapter.upsert_node(SceneNodeRecord{
+            .uuid = id,
+            .type = "crop_polygon",
+            .name = "Polygon region",
+            .crop_polygon = polygon,
+        }));
+        const auto json = lfs::io::JsonChapterDom::Json::parse(chapter.dom().dump());
+        auto parsed = SceneGraphChapter::parse(json.dump());
+        ASSERT_TRUE(parsed);
+        auto found = parsed->find(id);
+        ASSERT_TRUE(found && *found);
+        ASSERT_TRUE((*found)->crop_polygon);
+        EXPECT_EQ(*(*found)->crop_polygon, polygon);
+        EXPECT_FALSE((*found)->cropbox);
+        EXPECT_FALSE((*found)->ellipsoid);
+
+        using Json = lfs::io::JsonChapterDom::Json;
+        const auto expect_data_loss = [&](const auto& mutate) {
+            auto malformed = json;
+            mutate(malformed["nodes"][0]["crop_polygon"]);
+            auto result = SceneGraphChapter::parse(malformed.dump());
+            ASSERT_FALSE(result);
+            EXPECT_EQ(result.error().code(), lfs::ErrorCode::DataLoss);
+        };
+        expect_data_loss([](Json& value) {
+            Json vertices = Json::array();
+            for (int i = 0; i < 65; ++i) {
+                const float angle = 0.0966f * static_cast<float>(i);
+                vertices.push_back(Json::array({std::cos(angle), std::sin(angle)}));
+            }
+            value["vertices"] = std::move(vertices);
+        });
+        expect_data_loss([](Json& value) { value["vertices"][1][0] = nullptr; });
+        expect_data_loss([](Json& value) { value["vertices"] = Json::parse("[[0,0],[1,1],[2,2]]"); });
+        expect_data_loss([](Json& value) { value["half_depth"] = 0.0f; });
+        expect_data_loss([](Json& value) { value.erase("vertices"); });
+    }
+
     TEST(ProjectChapterTest, SceneGraphCameraHasImageDefaultsTrueWhenAbsent) {
         const auto node_id =
             uuid_literal("53000000-0000-4000-8000-000000000010");
@@ -836,7 +991,7 @@ namespace {
         params.dataset.output_path_explicit = true;
         params.overrides.dataset_json = R"({"images":"images","test_every":4})";
 
-        adopt_project_training_parameters(params, snapshot, "/data/scene", "images_4");
+        adopt_project_training_parameters(params, snapshot, "/data/scene", "images_4", {}, {});
 
         // Stored strategy, iterations and loading settings win over CLI defaults.
         EXPECT_EQ(params.optimization.strategy, "mcmc");

@@ -3,6 +3,7 @@
 
 #include "timeline.hpp"
 #include "core/logger.hpp"
+#include "core/native_fs.hpp"
 #include "core/path_utils.hpp"
 #include "interpolation.hpp"
 #include "io/atomic_output.hpp"
@@ -40,6 +41,11 @@ namespace lfs::sequencer {
 
         [[nodiscard]] bool validTime(const float time) {
             return std::isfinite(time) && std::abs(time) <= MAX_SEQUENCER_TIME_SECONDS;
+        }
+
+        [[nodiscard]] bool validRevealEffect(RevealEffect effect) {
+            const auto value = static_cast<int>(effect);
+            return value >= 1 && value <= 11;
         }
 
         [[nodiscard]] glm::quat normalizedRotation(const glm::quat& rotation) {
@@ -90,6 +96,21 @@ namespace lfs::sequencer {
                               lfs::rendering::MAX_FOCAL_LENGTH_MM);
         }
     } // namespace
+
+    float RevealClip::progress(const float time) const {
+        return std::clamp((time - start) / (end - start), 0.0f, 1.0f);
+    }
+
+    void Timeline::setRevealClip(std::optional<RevealClip> clip) {
+        if (clip && (!validTime(clip->start) || !validTime(clip->end) ||
+                     clip->start < 0.0f || clip->end <= clip->start ||
+                     !std::isfinite(clip->softness) || clip->softness <= 0.0f || clip->softness > 1.0f ||
+                     !validRevealEffect(clip->effect)))
+            throw std::invalid_argument("Invalid reveal clip");
+        reveal_clip_ = clip;
+        if (clip)
+            clip_duration_ = std::max(clip_duration_, clip->end);
+    }
 
     KeyframeId Timeline::addKeyframe(const Keyframe& keyframe) {
         Keyframe inserted = keyframe;
@@ -210,6 +231,7 @@ namespace lfs::sequencer {
     void Timeline::clear() {
         keyframes_.clear();
         clip_.reset();
+        reveal_clip_.reset();
         next_keyframe_id_ = 1;
         clip_duration_ = DEFAULT_CLIP_DURATION_SECONDS;
     }
@@ -243,7 +265,8 @@ namespace lfs::sequencer {
     void Timeline::setClipDuration(const float duration) {
         if (!std::isfinite(duration) || duration < 0.0f || duration > MAX_SEQUENCER_TIME_SECONDS)
             throw std::invalid_argument("Timeline duration is outside the supported range");
-        clip_duration_ = std::max({MIN_CLIP_DURATION_SECONDS, duration, realEndTime()});
+        clip_duration_ = std::max({MIN_CLIP_DURATION_SECONDS, duration, realEndTime(),
+                                   reveal_clip_ ? reveal_clip_->end : 0.0f});
     }
 
     CameraState Timeline::evaluate(const float time) const {
@@ -290,7 +313,9 @@ namespace lfs::sequencer {
     }
 
     void Timeline::sortKeyframes() {
-        std::sort(keyframes_.begin(), keyframes_.end());
+        // Equal-time keys keep their current order.
+        if (!std::is_sorted(keyframes_.begin(), keyframes_.end()))
+            std::stable_sort(keyframes_.begin(), keyframes_.end());
     }
 
     nlohmann::json Timeline::saveToJson() const {
@@ -311,11 +336,18 @@ namespace lfs::sequencer {
         }
         if (clip_)
             json["animation_clip"] = clip_->toJson();
+        if (reveal_clip_)
+            json["reveal_clip"] = {{"start", reveal_clip_->start}, {"end", reveal_clip_->end}, {"softness", reveal_clip_->softness}, {"effect", static_cast<int>(reveal_clip_->effect)}};
         return json;
     }
 
     bool Timeline::saveToJson(const std::string& path) const {
         try {
+            const auto json_bytes = saveToJson().dump(2);
+            if (json_bytes.size() > MAX_TIMELINE_JSON_BYTES) {
+                LOG_ERROR("Timeline output exceeds the 16 MiB file budget: {}", path);
+                return false;
+            }
             const std::filesystem::path path_fs = lfs::core::utf8_to_path(path);
             if (auto result = lfs::io::ensure_output_parent_directory(path_fs); !result) {
                 LOG_ERROR("Failed to prepare timeline output '{}': {}", path, result.error().format());
@@ -331,7 +363,7 @@ namespace lfs::sequencer {
                 LOG_ERROR("Failed to open timeline file: {}", path);
                 return false;
             }
-            file << saveToJson().dump(2);
+            file << json_bytes;
             file.close();
             if (!file) {
                 LOG_ERROR("Failed to write complete timeline file: {}", path);
@@ -400,7 +432,30 @@ namespace lfs::sequencer {
                         AnimationClip::fromJson(json["animation_clip"]));
             }
 
-            std::sort(loaded_keyframes.begin(), loaded_keyframes.end());
+            std::optional<RevealClip> loaded_reveal;
+            if (json.contains("reveal_clip")) {
+                const auto& value = json.at("reveal_clip");
+                RevealClip reveal{jsonFloat(value.at("start"), "Reveal start"),
+                                  jsonFloat(value.at("end"), "Reveal end"),
+                                  jsonFloat(value.at("softness"), "Reveal softness")};
+                if (value.contains("effect")) {
+                    if (!value.at("effect").is_number_integer())
+                        throw std::runtime_error("Invalid reveal effect");
+                    reveal.effect = static_cast<RevealEffect>(value.at("effect").get<int>());
+                }
+                if (!validTime(reveal.start) || !validTime(reveal.end) || reveal.start < 0.0f ||
+                    reveal.end <= reveal.start || reveal.softness <= 0.0f || reveal.softness > 1.0f || !validRevealEffect(reveal.effect))
+                    throw std::runtime_error("Invalid reveal clip");
+                loaded_reveal = reveal;
+            }
+
+            // IDs were assigned in file order, so use them to preserve ties
+            // without allocating a second keyframe buffer for a stable sort.
+            if (!std::is_sorted(loaded_keyframes.begin(), loaded_keyframes.end()))
+                std::sort(loaded_keyframes.begin(), loaded_keyframes.end(),
+                          [](const Keyframe& a, const Keyframe& b) {
+                              return a.time < b.time || (a.time == b.time && a.id < b.id);
+                          });
             float loaded_duration = DEFAULT_CLIP_DURATION_SECONDS;
             if (json.contains("clip_duration")) {
                 loaded_duration =
@@ -410,8 +465,8 @@ namespace lfs::sequencer {
                     throw std::runtime_error(
                         "Timeline clip_duration is outside the supported range");
                 }
-                if (loaded_duration == 0.0f)
-                    loaded_duration = DEFAULT_CLIP_DURATION_SECONDS;
+                // An explicit 0 is a duration. The clamp below matches setClipDuration.
+                // Only a missing key keeps DEFAULT_CLIP_DURATION_SECONDS.
             }
             float real_end_time = 0.0f;
             for (auto it = loaded_keyframes.rbegin();
@@ -422,10 +477,11 @@ namespace lfs::sequencer {
                 }
             }
             const float final_duration = std::max(
-                {MIN_CLIP_DURATION_SECONDS, loaded_duration, real_end_time});
+                {MIN_CLIP_DURATION_SECONDS, loaded_duration, real_end_time, loaded_reveal ? loaded_reveal->end : 0.0f});
 
             keyframes_ = std::move(loaded_keyframes);
             clip_ = std::move(loaded_clip);
+            reveal_clip_ = loaded_reveal;
             next_keyframe_id_ = next_keyframe_id;
             clip_duration_ = final_duration;
             return true;
@@ -448,7 +504,7 @@ namespace lfs::sequencer {
             }
 
             std::error_code size_error;
-            const uintmax_t file_size = std::filesystem::file_size(path_fs, size_error);
+            const uintmax_t file_size = lfs::core::native_fs::file_size(path_fs, size_error);
             if (size_error || file_size == 0 || file_size > MAX_TIMELINE_JSON_BYTES)
                 throw std::runtime_error("Timeline JSON is empty or exceeds the 16 MiB input budget");
             std::vector<char> json_bytes(static_cast<size_t>(file_size) + 1);
@@ -488,7 +544,7 @@ namespace lfs::sequencer {
     float Timeline::totalDuration() const {
         float camera_duration = duration();
         float clip_duration = clip_ ? clip_->duration() : 0.0f;
-        return std::max(camera_duration, clip_duration);
+        return std::max({camera_duration, clip_duration, reveal_clip_ ? reveal_clip_->end : 0.0f});
     }
 
 } // namespace lfs::sequencer

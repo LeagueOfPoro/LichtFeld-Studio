@@ -60,15 +60,9 @@ namespace lfs::vis::gui {
         bool key_alt = false;
         bool key_super = false;
         bool viewport_keyboard_focus = false;
+        std::vector<FrameInputEvent> input_events;
         std::vector<int> keys_pressed;
-        std::vector<int> keys_repeated;
-        std::vector<int> keys_released;
-        std::vector<uint32_t> text_codepoints;
-        std::vector<std::string> text_inputs;
-        std::string text_editing;
-        int text_editing_start = -1;
-        int text_editing_length = -1;
-        bool has_text_editing = false;
+
         void* bg_draw_list = nullptr;
         void* fg_draw_list = nullptr;
     };
@@ -189,6 +183,8 @@ namespace lfs::vis::gui {
         static constexpr float SCENE_PANEL_MIN_HEIGHT = 200.0f;
         static constexpr float DOCK_GRIP_H = 8.0f;
         static constexpr float TAB_BAR_H = 28.0f;
+        static constexpr float RIGHT_TAB_BAR_W = 28.0f;
+        static constexpr float RIGHT_PANEL_SECTION_GAP = 4.0f;
         static constexpr float STATUS_BAR_HEIGHT = 22.0f;
         static constexpr float PANEL_GAP = 2.0f;
         // Matches #resize-handle in right_panel.rcss: left: -4dp; width: 8dp.

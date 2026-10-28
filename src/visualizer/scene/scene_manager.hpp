@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "core/event_bridge/scoped_handler.hpp"
 #include "core/events.hpp"
 #include "core/export.hpp"
 #include "core/parameters.hpp"
@@ -17,6 +18,7 @@
 #include "selection/selection_service.hpp"
 #include "training/components/ppisp.hpp"
 #include "training/components/ppisp_controller_pool.hpp"
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <functional>
@@ -59,6 +61,7 @@ namespace lfs::vis {
         }
 
         [[nodiscard]] bool canClearScene() const;
+        [[nodiscard]] bool canApplyCropToNode(core::NodeId id) const;
 
         bool hasDataset() const {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -107,20 +110,20 @@ namespace lfs::vis {
         [[nodiscard]] std::expected<lfs::io::LoadResult, std::string> stageSplatFile(
             const std::filesystem::path& path,
             lfs::io::ProgressCallback progress = {},
-            lfs::io::CancelCallback cancel_requested = {}, bool preserve_raw = false);
+            lfs::io::CancelCallback cancel_requested = {}, bool preserve_raw = false, std::string* user_error = nullptr);
         [[nodiscard]] std::string attachLoadedSplatFile(const std::filesystem::path& path,
                                                         const std::string& name_hint,
                                                         bool is_visible,
                                                         lfs::io::LoadResult load_result,
                                                         bool replace_scene,
-                                                        bool defer_import_license = false);
+                                                        bool defer_import_license = false, core::Uuid* imported_uuid = nullptr, uint32_t* import_selection_generation = nullptr, bool internal_import = false);
         [[nodiscard]] std::string attachLoadedSplatNode(const std::filesystem::path& path,
                                                         const std::string& name_hint,
                                                         bool is_visible,
                                                         lfs::io::LoadResult load_result,
                                                         bool preserve_raw = false,
                                                         core::NodeId parent = core::NULL_NODE,
-                                                        bool defer_import_license = false);
+                                                        bool defer_import_license = false, core::Uuid* imported_uuid = nullptr, uint32_t* import_selection_generation = nullptr);
         void setImportLicenseCallback(std::function<void(const std::optional<std::vector<uint8_t>>&)> callback) {
             import_license_callback_ = std::move(callback);
         }
@@ -143,12 +146,13 @@ namespace lfs::vis {
         void setPLYVisibility(std::string name, bool visible);
         [[nodiscard]] std::expected<void, std::string> removeNodeWithResult(core::NodeId id, bool keep_children = false);
         void removeNode(core::NodeId id, bool keep_children = false);
+        [[nodiscard]] bool discardFailedImport(const core::Uuid& uuid);
         void setNodeVisibility(core::NodeId id, bool visible);
         void setNodeVisibilityTransient(core::NodeId id, bool visible);
 
         // Node selection
         void selectNode(const std::string& name);
-        void selectNode(core::NodeId id);
+        void selectNode(core::NodeId id, uint32_t* import_selection_generation = nullptr);
         void selectNodes(const std::vector<std::string>& names);
         void selectNodesById(const std::vector<core::NodeId>& ids);
         void addToSelection(const std::string& name);
@@ -200,6 +204,10 @@ namespace lfs::vis {
         const core::EllipsoidData* getSelectedNodeEllipsoid() const;
         core::NodeId getActiveSelectionEllipsoidId() const;
 
+        // The selected crop polygon, or the one attached to the selected splat.
+        core::NodeId getSelectedNodeCropPolygonId() const;
+        core::NodeId getActiveSelectionCropPolygonId() const;
+
         std::expected<void, std::string> loadDataset(const std::filesystem::path& path,
                                                      const lfs::core::param::TrainingParameters& params);
 
@@ -218,7 +226,7 @@ namespace lfs::vis {
 
         void loadCheckpointForTraining(const std::filesystem::path& path,
                                        const lfs::core::param::TrainingParameters& params);
-        [[nodiscard]] bool clear();
+        [[nodiscard]] bool clear(bool internal_import = false);
         void switchToEditMode(); // Keep trained model, discard dataset
 
         // For rendering - gets appropriate model
@@ -309,13 +317,15 @@ namespace lfs::vis {
         void completePendingSelectionCounts() const;
 
         void setAppearanceModel(std::unique_ptr<lfs::training::PPISP> ppisp,
-                                std::unique_ptr<lfs::training::PPISPControllerPool> controller_pool = nullptr);
+                                std::unique_ptr<lfs::training::PPISPControllerPool> controller_pool = nullptr,
+                                bool training_viewport = false);
         void clearAppearanceModel();
         [[nodiscard]] lfs::training::PPISP* getAppearancePPISP() { return appearance_ppisp_.get(); }
         [[nodiscard]] const lfs::training::PPISP* getAppearancePPISP() const { return appearance_ppisp_.get(); }
         [[nodiscard]] lfs::training::PPISPControllerPool* getAppearanceControllerPool() { return appearance_controller_pool_.get(); }
         [[nodiscard]] const lfs::training::PPISPControllerPool* getAppearanceControllerPool() const { return appearance_controller_pool_.get(); }
         [[nodiscard]] bool hasAppearanceController() const { return appearance_controller_pool_ != nullptr; }
+        [[nodiscard]] bool appearanceUsesTrainingViewport() const { return appearance_training_viewport_; }
         [[nodiscard]] bool hasAppearanceModel() const { return appearance_ppisp_ != nullptr; }
 
         // Drop the GUI's borrowed scene-image tensor and drain the GPU so no
@@ -346,7 +356,7 @@ namespace lfs::vis {
             std::vector<std::string> removed_node_names;
         };
 
-        [[nodiscard]] bool resetToEmptyState(bool trainer_already_cleared = false);
+        [[nodiscard]] bool resetToEmptyState(bool trainer_already_cleared = false, bool internal_import = false);
         enum class TrainingRemovalImpact {
             None,
             TrainingModel,
@@ -362,7 +372,7 @@ namespace lfs::vis {
         [[nodiscard]] std::expected<void, std::string> removeNodeImpl(core::NodeId id,
                                                                       bool keep_children,
                                                                       HistoryMode history_mode,
-                                                                      TrainingRemovalImpact impact);
+                                                                      TrainingRemovalImpact impact, bool internal_import = false);
         void setupEventHandlers();
         void finalizeDatasetSceneLoad(const std::filesystem::path& dataset_path,
                                       const std::filesystem::path& scene_path,
@@ -374,6 +384,9 @@ namespace lfs::vis {
         void loadPPISPCompanion(const std::filesystem::path& ppisp_path);
         void handleCropActivePly(const lfs::geometry::BoundingBox& crop_box, bool inverse, core::NodeId target_node_id = core::NULL_NODE);
         void handleCropByEllipsoid(const glm::mat4& world_transform, const glm::vec3& radii, bool inverse, core::NodeId target_node_id = core::NULL_NODE);
+        void handleCropByPolygon(const glm::mat4& world_transform, const core::CropPolygonData& polygon, core::NodeId target_node_id);
+        void cropPointCloudByPolygon(core::NodeId node_id, const glm::mat4& world_transform,
+                                     const core::CropPolygonData& polygon);
         void handleRenamePly(const lfs::core::events::cmd::RenamePLY& event);
         void handleAddCropBox(std::string node_name);
         void handleAddCropBox(core::NodeId node_id);
@@ -415,7 +428,10 @@ namespace lfs::vis {
                 glm::mat4 local_transform{1.0f};
                 bool visible = true;
                 bool locked = false;
+                bool point_cloud_source = false;
                 std::unique_ptr<lfs::core::SplatData> data;
+                std::shared_ptr<lfs::core::MeshData> mesh;
+                std::shared_ptr<const core::CollisionVolume> collision{};
                 std::unique_ptr<core::CropBoxData> cropbox;
                 std::unique_ptr<core::EllipsoidData> ellipsoid;
                 std::vector<HierarchyNode> children;
@@ -437,6 +453,7 @@ namespace lfs::vis {
         ClipboardEntry::HierarchyNode copyNodeHierarchy(const core::SceneNode* node);
         void pasteNodeHierarchy(const ClipboardEntry::HierarchyNode& src, core::NodeId parent_id);
 
+        bool appearance_training_viewport_ = false;
         std::unique_ptr<lfs::training::PPISP> appearance_ppisp_;
         std::unique_ptr<lfs::training::PPISPControllerPool> appearance_controller_pool_;
 
@@ -460,6 +477,8 @@ namespace lfs::vis {
         mutable const lfs::core::SplatData* cached_render_model_ = nullptr;
         mutable ContentType cached_render_content_type_ = ContentType::Empty;
         mutable bool cached_render_metadata_only_ = false;
+
+        lfs::event::ScopedHandler event_handlers_;
     };
 
 } // namespace lfs::vis

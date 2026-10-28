@@ -6,6 +6,7 @@
 #pragma once
 
 #include "core/checkpoint_format.hpp"
+#include "core/collision.hpp"
 #include "core/error.hpp"
 #include "core/export.hpp"
 #include "io/geometry_payload.hpp"
@@ -96,6 +97,8 @@ namespace lfs::io::project {
         // Skip Impl::validate after the chapter scan. Hydration re-opens a
         // path the shell already validated; identity is checked by the caller.
         bool skip_validation = false;
+        // Optional validated source: retain its file handle, path and exact commit. Borrowed only during open().
+        const ProjectReader* retained_source = nullptr;
     };
 
     struct ProjectDocumentSaveOptions {
@@ -118,6 +121,9 @@ namespace lfs::io::project {
         // missing THMB.
         std::span<const std::byte> preview_png;
         bool remove_preview = false;
+        // Save As may omit run metrics from the destination while preserving
+        // the open source document if publication fails.
+        bool omit_metrics = false;
         // When enabled, an ordinary explicit save creates a dataset preview
         // only when the opened source has no THMB.
         bool regenerate_dataset_preview = true;
@@ -171,6 +177,9 @@ namespace lfs::io::project {
         std::uint64_t disk_reserve_bytes = 64ull * 1024 * 1024;
         std::optional<WriterLockLease> writer_lock_lease =
             std::nullopt;
+        // Recovered sessions keep their materialized document on a staging
+        // path while autosaves remain bound to the original master.
+        std::optional<std::filesystem::path> recovery_base_path;
         CommitBoundaryObserver boundary_observer;
     };
 
@@ -324,15 +333,22 @@ namespace lfs::io::project {
         [[nodiscard]] std::vector<lfs::core::Uuid>
         dataset_source_uuids() const;
         [[nodiscard]] lfs::Result<ProjectDocumentSaveReport>
-        embed_dataset_batch(const EmbeddedDatasetManifest& manifest,
+        embed_dataset_batch(EmbeddedDatasetManifest manifest,
                             std::span<const DatasetEmbedSource> sources,
-                            const ProjectDocumentSaveOptions& options = {});
+                            const ProjectDocumentSaveOptions& options = {},
+                            std::function<void(float, const std::string&)> progress = {},
+                            std::function<bool()> cancel = {});
 
         [[nodiscard]] const LazyChunkValue*
         find_ppisp(const lfs::core::Uuid& instance_uuid) const noexcept;
         [[nodiscard]] lfs::Result<void>
         set_ppisp(const lfs::core::Uuid& instance_uuid,
                   LazyChunkValue payload);
+        // The single SfM observation chapter (SFMO), or null.
+        [[nodiscard]] const LazyChunkValue* find_sfm_observations() const noexcept;
+        // Replaces the SFMO chapter; nullopt removes it.
+        [[nodiscard]] lfs::Result<void>
+        set_sfm_observations(std::optional<LazyChunkValue> payload);
         [[nodiscard]] lfs::Result<void>
         set_georeference(const ProjectGeoreference& value);
         [[nodiscard]] lfs::Result<void>
@@ -364,7 +380,10 @@ namespace lfs::io::project {
         [[nodiscard]] lfs::Result<void>
         set_mesh(const lfs::core::Uuid& node_uuid, MeshPayload payload);
         [[nodiscard]] bool remove_mesh(const lfs::core::Uuid& node_uuid);
-        // Drop SPLT/PCLD/MESH payloads the current scene graph no longer binds.
+        [[nodiscard]] lfs::Result<void>
+        set_collision(const lfs::core::Uuid& instance_uuid,
+                      std::shared_ptr<const lfs::core::CollisionVolume> volume);
+        // Drop SPLT/PCLD/MESH/COLV payloads the current scene graph no longer binds.
         void remove_geometry_payloads_not_bound_by_scene();
 
         [[nodiscard]] std::vector<lfs::core::Uuid> splat_uuids() const;
@@ -381,12 +400,17 @@ namespace lfs::io::project {
         [[nodiscard]] lfs::Result<ProjectDocumentSaveReport>
         save_as(const std::filesystem::path& path,
                 const ProjectDocumentSaveOptions& options = {});
-        // Builds one complete overlay relative to the currently opened
-        // master. It never clears dirty state or regenerates THMB.
+        // Builds one complete overlay relative to the opened master. It never
+        // clears dirty state or regenerates THMB.
         [[nodiscard]] lfs::Result<ProjectDocumentSaveReport>
         save_autosave(
             const std::filesystem::path& sidecar_path,
             const ProjectDocumentAutosaveOptions& options);
+        // Carry the selected recovery overlay forward when publishing the
+        // next autosave against its original master.
+        [[nodiscard]] lfs::Result<void>
+        prepare_recovery_autosave(
+            const std::filesystem::path& sidecar_path);
         // Append THMB onto the current source generation without encoding
         // dirty chapters or payloads. Clean proofs are rebound to the new
         // head so a later save can carry the thumbnail forward.
@@ -405,6 +429,14 @@ namespace lfs::io::project {
         stage_hydration(
             lfs::core::Scene& destination,
             const ScenePayloadResolver& external_payloads = {},
+            lfs::core::SplatTensorAllocator splat_allocator = {},
+            std::function<void(std::size_t, std::size_t)> payload_progress = {}) const;
+
+        // Stage only these saved nodes for a partial payload commit after Undo.
+        [[nodiscard]] lfs::Result<ProjectHydrationPlan>
+        stage_payload_hydration_for_nodes(
+            lfs::core::Scene& destination,
+            std::span<const lfs::core::Uuid> node_uuids,
             lfs::core::SplatTensorAllocator splat_allocator = {},
             std::function<void(std::size_t, std::size_t)> payload_progress = {}) const;
 
@@ -434,6 +466,13 @@ namespace lfs::io::project {
             std::span<const ReferenceOwnerBinding> additional_bindings = {}) const;
 
     private:
+        [[nodiscard]] lfs::Result<ProjectHydrationPlan>
+        stage_hydration_filtered(
+            lfs::core::Scene& destination,
+            const ScenePayloadResolver& external_payloads,
+            lfs::core::SplatTensorAllocator splat_allocator,
+            std::function<void(std::size_t, std::size_t)> payload_progress,
+            std::optional<std::span<const lfs::core::Uuid>> node_uuids) const;
         [[nodiscard]] lfs::Result<ProjectDocumentSaveReport>
         save_impl(
             const std::filesystem::path& path,

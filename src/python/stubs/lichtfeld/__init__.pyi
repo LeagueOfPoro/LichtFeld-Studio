@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Sequence
 import enum
-from typing import TypeAlias, overload
+from typing import Annotated, TypeAlias, overload
 
 from numpy.typing import NDArray
 import typing_extensions
@@ -27,11 +27,18 @@ from . import (
     ui as ui,
     undo as undo
 )
+from .scene import (
+    cancel_collision as cancel_collision,
+    export_collision as export_collision,
+    generate_collision as generate_collision,
+    get_collision_state as get_collision_state,
+    set_walk_settings as set_walk_settings
+)
 
 
 class Error(RuntimeError):
     """
-    Base class for every typed LichtFeld error crossing the Python boundary. Derives RuntimeError for backward compatibility. Carries .code, .domain, .user_message, .operation_id, .retryable, .details, and .context.
+    Base class for every typed LichtFeld error crossing the Python boundary. Derives RuntimeError for backward compatibility. Carries .code, .domain, .user_message, .operation_id, .retryable, .details, and .context. Presentation fields .message_key and .message_details are included when provided.
     """
 
 class InvalidArgumentError(Error, ValueError):
@@ -66,6 +73,8 @@ class OperatorResult(enum.Enum):
 
 class ProjectOpenOutcome(enum.Enum):
     OPENED = 0
+
+    DEFERRED = 2
 
     RECOVERY_PROMPT_PENDING = 1
 
@@ -242,6 +251,9 @@ def finish_reason() -> str | None:
 def trainer_error() -> str | None:
     """Get trainer error message"""
 
+def trainer_error_key() -> str | None:
+    """Get the optional localization key for the trainer error message"""
+
 def prepare_training_from_scene() -> None:
     """Initialize trainer from existing scene cameras and point cloud"""
 
@@ -297,6 +309,9 @@ def project_save(wait: bool = False, regenerate_preview: bool = True) -> bool:
 def project_save_as(path: str = '', wait: bool = False) -> bool:
     """Save the active project to a new .licht path"""
 
+def project_save_as_for_training_start(path: str = '', wait: bool = False) -> bool:
+    """Save a clean project for a new training run"""
+
 def project_get_license() -> dict | None:
     """Return the license metadata for the active project, or None"""
 
@@ -325,11 +340,22 @@ def project_clean(destination: str = '', expected_commit: str = '') -> bool:
     Clean the active saved project in the background, preserving its current resume point
     """
 
+def project_write_training_copy(destination: str, progress: object | None = None, cancel: object | None = None) -> io.DatasetEmbedResult:
+    """
+    Write a new untrained project from the pending parameters with the loaded dataset embedded; it blocks, so call it off the UI thread
+    """
+
 def project_is_dirty() -> bool:
     """Return whether the active project has unsaved chapters"""
 
 def project_has_path() -> bool:
     """Return whether the active project has a bound .licht path"""
+
+def project_path() -> str | None:
+    """Return the active project's bound .licht path, or None"""
+
+def project_uuid() -> str | None:
+    """Return the active project UUID (kept across saves), or None"""
 
 def project_can_embed_dataset() -> bool:
     """Return whether the active project can embed its external dataset"""
@@ -379,8 +405,11 @@ def clear_scene() -> None:
 def switch_to_edit_mode() -> None:
     """Switch from training to edit mode"""
 
-def load_file(path: str, is_dataset: bool = False, output_path: str = '', init_path: str = '', centralize_dataset: str = 'off', max_width: int | None = None, apply_auto_crop: bool = False, min_track_length: int | None = None, stop_training: bool = False, discard_changes: bool = False, replace: bool = False) -> None:
+def load_file(path: str, is_dataset: bool = False, output_path: str = '', init_path: str = '', centralize_dataset: str = 'off', max_width: int | None = None, apply_auto_crop: bool = False, min_track_length: int | None = None, stop_training: bool = False, discard_changes: bool = False, replace: bool = False, images_folder: str = '') -> None:
     """Load a file (PLY, checkpoint) or dataset into the scene."""
+
+def load_files(paths: Sequence[str], stop_training: bool = False, discard_changes: bool = False, replace: bool = False, _user_batch: bool = False) -> None:
+    """Import splat and mesh files as one ordered batch."""
 
 def load_config_file(path: str) -> None:
     """Load a JSON configuration file."""
@@ -481,6 +510,9 @@ def set_vram_profiler_enabled(enabled: bool) -> None:
 def get_vram_profiler_enabled() -> bool:
     """Return whether the live VRAM diagnostics profiler is enabled"""
 
+def vram_owner_breakdown() -> dict:
+    """Return a sampled process VRAM breakdown by owner category"""
+
 def set_node_visibility(name: str, visible: bool) -> None:
     """Set visibility of a scene node by name"""
 
@@ -558,11 +590,20 @@ def get_colmap_sparse_source_path() -> str | None:
 def get_node_visualizer_world_transform(name: str) -> list[float] | None:
     """Get node visualizer-world transform matrix (16 floats, column-major)"""
 
-def set_node_transform(name: str, matrix: Sequence[float]) -> None:
-    """Set node transform matrix (16 floats, column-major)"""
+def commit_node_transforms(node_names: Sequence[str], old_transforms: Sequence[Sequence[float]]) -> None:
+    """
+    Record a completed preview edit as one undo step using its original local transforms
+    """
 
-def set_node_visualizer_world_transform(name: str, matrix: Sequence[float]) -> None:
-    """Set node visualizer-world transform matrix (16 floats, column-major)"""
+def set_node_transform(name: str, matrix: Sequence[float], *, record_history: bool = True) -> None:
+    """
+    Set node transform matrix (16 floats, column-major). Disable record_history for previews committed with commit_node_transforms.
+    """
+
+def set_node_visualizer_world_transform(name: str, matrix: Sequence[float], *, record_history: bool = True) -> None:
+    """
+    Set node visualizer-world transform matrix (16 floats, column-major). Disable record_history for previews committed with commit_node_transforms.
+    """
 
 def bake_selected_node_transforms() -> int:
     """
@@ -596,6 +637,17 @@ def focus_selection() -> bool:
     Focus the active viewport on the selection, or the whole scene when nothing is selected
     """
 
+def go_home() -> None:
+    """Move the active viewport to its home view"""
+
+def set_home() -> None:
+    """Make the active viewport's current view its home view"""
+
+def reset_home() -> None:
+    """
+    Restore the default home view of the active viewport and move the camera there
+    """
+
 def get_camera_navigation_mode() -> str:
     """
     Get the active camera navigation mode ('orbit', 'trackball', 'fpv', or 'drone')
@@ -603,6 +655,25 @@ def get_camera_navigation_mode() -> str:
 
 def set_camera_navigation_mode(mode: str) -> None:
     """Set the active camera navigation mode"""
+
+def get_new_project_navigation_up_axis() -> str:
+    """Get the navigation vertical used only for new projects"""
+
+def get_new_project_align_grid() -> bool:
+    """
+    Get whether new projects start with a grid perpendicular to their navigation vertical
+    """
+
+def set_new_project_navigation_defaults(axis: str, align_grid: bool) -> None:
+    """Set new-project defaults without modifying the current project"""
+
+def get_navigation_up_axis() -> str:
+    """Get the project navigation vertical: legacy_y or data_z"""
+
+def set_navigation_up_axis(axis: str, align_grid: bool = False) -> None:
+    """
+    Set the project navigation vertical without transforming scene data or camera poses; optionally align both panel grids
+    """
 
 def get_camera_view_snap_enabled() -> bool:
     """Check whether camera axis-view snapping is enabled"""
@@ -636,6 +707,9 @@ def toggle_vram_hud() -> None:
     """
     Toggle the VRAM diagnostics HUD overlay (requires vram profiler enabled)
     """
+
+def toggle_perf_hud_expanded() -> None:
+    """Toggle the performance HUD between its full and compact views"""
 
 def is_perf_hud_visible() -> bool:
     """True when the performance HUD is currently shown"""
@@ -752,7 +826,7 @@ class Tensor:
         """Count non-zero elements"""
 
     @staticmethod
-    def from_numpy(arr: NDArray, copy: bool = True) -> Tensor:
+    def from_numpy(arr: Annotated[NDArray, dict(device='cpu')], copy: bool = True) -> Tensor:
         """Create tensor from NumPy array"""
 
     @staticmethod
@@ -801,10 +875,10 @@ class Tensor:
     def from_dlpack(obj: object) -> Tensor:
         """Create tensor from DLPack capsule or object"""
 
-    def __getitem__(self, arg: object, /) -> Tensor:
+    def __getitem__(self, key: object | None) -> Tensor:
         """Get item/slice"""
 
-    def __setitem__(self, arg0: object, arg1: object, /) -> None:
+    def __setitem__(self, key: object | None, value: object) -> None:
         """Set item/slice"""
 
     @overload
@@ -1477,6 +1551,29 @@ def render_view_u8(rotation: Tensor, translation: Tensor, width: int, height: in
         CPU uint8 Tensor [H, W, 3] RGB image, or None if no active visualizer scene is available
     """
 
+def render_lightfield_view_u8(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, shift_x: float = 0.0, near_distance: float = 0.0, far_distance: float = 100000.0) -> Tensor | None:
+    """
+    Render a parallel off-axis perspective view for light-field quilts.
+
+    rotation is a [3, 3] camera-to-world rotation and translation is a [3] world
+    position, using the visualizer camera convention. fov is vertical degrees
+    (default: 60).
+    shift_x offsets the principal point horizontally in pixels; positive values
+    move the principal point right. near_distance and far_distance clip Gaussian
+    centers by camera-space forward distance, not the tails of individual splats.
+
+    Selection highlights are hidden. Projection, clipping, splat scale and editor
+    visualization overrides are local to this render; the viewport settings and
+    model are not changed. Other current render settings, such as background and
+    appearance, are retained. Rendering is dispatched to the viewer thread when
+    necessary.
+
+    Returns a CPU uint8 Tensor [H, W, 3] RGB image, or None when there is no renderable
+    scene, arguments are invalid, or rendering fails. Width and height must be
+    1-2048, fov must be 1-120, shift_x must be finite, and clipping distances must
+    be finite with 0 <= near_distance < far_distance.
+    """
+
 def compute_screen_positions(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0) -> Tensor | None:
     """
     Compute screen positions of all Gaussians for a given camera view.
@@ -1960,6 +2057,20 @@ class MaskMode(enum.Enum):
 
     ALPHA_CONSISTENT = 4
 
+class EvalSpace(enum.Enum):
+    DISTORTED = 0
+
+    UNDISTORTED = 1
+
+class EvalBitDepth(enum.Enum):
+    AUTO = 0
+
+    EIGHT = 1
+
+    SIXTEEN = 2
+
+    FLOAT = 3
+
 class DensifyErrorMap(enum.Enum):
     SSIM = 0
 
@@ -1992,6 +2103,9 @@ class OptimizationParams:
 
     def get(self, name: str) -> object:
         """Get property value by name"""
+
+    def builtin_default(self, name: str) -> object:
+        """Get the built-in default for the active method and step scaling"""
 
     def set(self, name: str, value: object) -> None:
         """Set property value by name"""
@@ -2090,11 +2204,34 @@ class OptimizationParams:
     def cropbox_loss_weight(self, arg: float, /) -> None: ...
 
     @property
+    def cropbox_growth_inside(self) -> float:
+        """Share of new splats placed inside the active crop box"""
+
+    @cropbox_growth_inside.setter
+    def cropbox_growth_inside(self, arg: float, /) -> None: ...
+
+    @property
     def lambda_dssim(self) -> float:
         """Weight for structural similarity loss"""
 
     @lambda_dssim.setter
     def lambda_dssim(self, arg: float, /) -> None: ...
+
+    @property
+    def color_variance_weight(self) -> float:
+        """
+        Reduces noise in stochastic rendering by aligning visible splat colors; 0 disables
+        """
+
+    @color_variance_weight.setter
+    def color_variance_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def color_variance_warmup_iters(self) -> int:
+        """Completed training iterations before color variance starts"""
+
+    @color_variance_warmup_iters.setter
+    def color_variance_warmup_iters(self, arg: int, /) -> None: ...
 
     @property
     def sh_degree(self) -> int:
@@ -2129,54 +2266,47 @@ class OptimizationParams:
     def enable_eval(self, arg: bool, /) -> None: ...
 
     @property
-    def background_improvements(self) -> bool:
-        """
-        Improve distant background reconstruction (MRNF): far-field seeding and splits, decay relief, growth cap, per-splat position steps, visibility-ratio growth ranking, paced capacity fill
-        """
+    def eval_all(self) -> bool:
+        """Train on every image and evaluate all of them; no image is held out"""
 
-    @background_improvements.setter
-    def background_improvements(self, arg: bool, /) -> None: ...
+    @eval_all.setter
+    def eval_all(self, arg: bool, /) -> None: ...
 
     @property
-    def far_scene_min_fraction(self) -> float:
+    def eval_flip(self) -> bool:
         """
-        Minimum deep-far splat fraction that activates far-field features (0 = always on)
+        Also compute FLIP per evaluated image and save its error map next to the evaluation images
         """
 
-    @far_scene_min_fraction.setter
-    def far_scene_min_fraction(self, arg: float, /) -> None: ...
+    @eval_flip.setter
+    def eval_flip(self, arg: bool, /) -> None: ...
 
     @property
-    def growth_ratio_rank(self) -> bool:
+    def eval_mask(self) -> str:
         """
-        Rank MRNF growth by visibility-normalized error (err/vis^p) instead of raw window error
+        Scores only part of each evaluated image (a mesh, a box, the crop box, a mask folder, a depth range, points or a splat); training is not affected
         """
 
-    @growth_ratio_rank.setter
-    def growth_ratio_rank(self, arg: bool, /) -> None: ...
+    @eval_mask.setter
+    def eval_mask(self, arg: str, /) -> None: ...
 
     @property
-    def growth_ratio_pow(self) -> float:
-        """Visibility exponent p for the err/vis^p growth rank"""
-
-    @growth_ratio_pow.setter
-    def growth_ratio_pow(self, arg: float, /) -> None: ...
-
-    @property
-    def fill_pacing_iter(self) -> int:
-        """Pace MRNF cap fill until this iteration (0 = fill as fast as possible)"""
-
-    @fill_pacing_iter.setter
-    def fill_pacing_iter(self, arg: int, /) -> None: ...
-
-    @property
-    def far_seed_dose(self) -> int:
+    def eval_mask_report(self) -> str:
         """
-        Far-field seeds injected per refine window (0 = starvation-scaled default)
+        Pixel sets scored with the evaluation mask, comma list of mask, unmasked and inverted; the first is the headline set, whose scores go to metrics.csv, the log and the training panel. Empty: the mask
         """
 
-    @far_seed_dose.setter
-    def far_seed_dose(self, arg: int, /) -> None: ...
+    @eval_mask_report.setter
+    def eval_mask_report(self, arg: str, /) -> None: ...
+
+    @property
+    def eval_mask_opacity(self) -> float:
+        """
+        Rendered opacity a pixel needs to count as covered by a splat mask; lower widens the mask past the outline, higher pulls it in
+        """
+
+    @eval_mask_opacity.setter
+    def eval_mask_opacity(self, arg: float, /) -> None: ...
 
     @property
     def densify_error_map(self) -> DensifyErrorMap:
@@ -2200,15 +2330,6 @@ class OptimizationParams:
 
     @screen_share_penalty.setter
     def screen_share_penalty(self, arg: float, /) -> None: ...
-
-    @property
-    def oversize_split_fraction(self) -> float:
-        """
-        Fraction of MRNF growth budget used to split Gaussians over the screen-share cap; 0 disables
-        """
-
-    @oversize_split_fraction.setter
-    def oversize_split_fraction(self, arg: float, /) -> None: ...
 
     @property
     def steps_scaler(self) -> float:
@@ -2253,10 +2374,112 @@ class OptimizationParams:
 
     @property
     def enable_sparsity(self) -> bool:
-        """Enable sparsity optimization"""
+        """Run POPSpa sparsification after training"""
 
     @enable_sparsity.setter
     def enable_sparsity(self, arg: bool, /) -> None: ...
+
+    @property
+    def popspa_target_count(self) -> int: ...
+
+    @popspa_target_count.setter
+    def popspa_target_count(self, arg: int, /) -> None: ...
+
+    @property
+    def popspa_first_prune_count(self) -> int: ...
+
+    @popspa_first_prune_count.setter
+    def popspa_first_prune_count(self, arg: int, /) -> None: ...
+
+    @property
+    def popspa_sparsify_steps(self) -> int: ...
+
+    @popspa_sparsify_steps.setter
+    def popspa_sparsify_steps(self, arg: int, /) -> None: ...
+
+    @property
+    def popspa_refine_steps(self) -> int: ...
+
+    @popspa_refine_steps.setter
+    def popspa_refine_steps(self, arg: int, /) -> None: ...
+
+    @property
+    def popspa_projection_interval(self) -> int: ...
+
+    @popspa_projection_interval.setter
+    def popspa_projection_interval(self, arg: int, /) -> None: ...
+
+    @property
+    def popspa_seed(self) -> int: ...
+
+    @popspa_seed.setter
+    def popspa_seed(self, arg: int, /) -> None: ...
+
+    @property
+    def popspa_rho(self) -> float: ...
+
+    @popspa_rho.setter
+    def popspa_rho(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_erank_weight(self) -> float: ...
+
+    @popspa_erank_weight.setter
+    def popspa_erank_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_thin_scale_weight(self) -> float: ...
+
+    @popspa_thin_scale_weight.setter
+    def popspa_thin_scale_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_erank_epsilon(self) -> float: ...
+
+    @popspa_erank_epsilon.setter
+    def popspa_erank_epsilon(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_means_lr(self) -> float: ...
+
+    @popspa_means_lr.setter
+    def popspa_means_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_scales_lr(self) -> float: ...
+
+    @popspa_scales_lr.setter
+    def popspa_scales_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_opacities_lr(self) -> float: ...
+
+    @popspa_opacities_lr.setter
+    def popspa_opacities_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_quaternions_lr(self) -> float: ...
+
+    @popspa_quaternions_lr.setter
+    def popspa_quaternions_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_sh0_lr(self) -> float: ...
+
+    @popspa_sh0_lr.setter
+    def popspa_sh0_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_shn_lr(self) -> float: ...
+
+    @popspa_shn_lr.setter
+    def popspa_shn_lr(self, arg: float, /) -> None: ...
+
+    @property
+    def popspa_ssim_weight(self) -> float: ...
+
+    @popspa_ssim_weight.setter
+    def popspa_ssim_weight(self, arg: float, /) -> None: ...
 
     @property
     def mip_filter(self) -> bool:
@@ -2396,6 +2619,15 @@ class OptimizationParams:
     def depth_loss_mode(self, arg: str, /) -> None: ...
 
     @property
+    def depth_auto_generate(self) -> bool:
+        """
+        Generate missing or size-mismatched depth maps with MoGe-2 from the full-resolution images/ folder
+        """
+
+    @depth_auto_generate.setter
+    def depth_auto_generate(self, arg: bool, /) -> None: ...
+
+    @property
     def use_normal_loss(self) -> bool:
         """Load normal maps and use normal-map supervision during training"""
 
@@ -2459,10 +2691,30 @@ class OptimizationParams:
 
     @property
     def undistort(self) -> bool:
-        """Undistort images on-the-fly before training"""
+        """
+        Remove lens distortion before training: each image and its mask, depth and normal map are resampled once from full resolution into a distortion-free pinhole camera, which training then uses. Alternative to --gut for distorted or non-pinhole cameras
+        """
 
     @undistort.setter
     def undistort(self, arg: bool, /) -> None: ...
+
+    @property
+    def eval_space(self) -> EvalSpace:
+        """
+        Reference images for evaluation with --undistort: distorted = the original images, with the render warped into the original lens; undistorted = the undistorted training images
+        """
+
+    @eval_space.setter
+    def eval_space(self, arg: EvalSpace, /) -> None: ...
+
+    @property
+    def eval_bit_depth(self) -> EvalBitDepth:
+        """
+        Grid the render is quantized to before evaluation metrics: auto = each reference image's own encoding (8-bit, 16-bit or float)
+        """
+
+    @eval_bit_depth.setter
+    def eval_bit_depth(self, arg: EvalBitDepth, /) -> None: ...
 
     @property
     def save_steps(self) -> list[int]:
@@ -2534,6 +2786,12 @@ class DatasetParams:
         """Subfolder name containing images"""
 
     @property
+    def init_path(self) -> str:
+        """
+        Training initialization file; empty when training starts from the dataset's points
+        """
+
+    @property
     def test_every(self) -> int:
         """Use every Nth image for testing"""
 
@@ -2574,6 +2832,34 @@ class DatasetParams:
 
     @use_16bit_color.setter
     def use_16bit_color(self, arg: bool, /) -> None: ...
+
+    @property
+    def sharpen_kernel(self) -> str:
+        """Training image sharpening filter: 'usm', 'laplacian4' or 'laplacian8'"""
+
+    @sharpen_kernel.setter
+    def sharpen_kernel(self, arg: str, /) -> None: ...
+
+    @property
+    def sharpen_amount(self) -> float:
+        """Strength of training image sharpening, 0 to 5; 0 turns it off"""
+
+    @sharpen_amount.setter
+    def sharpen_amount(self, arg: float, /) -> None: ...
+
+    @property
+    def sharpen_radius(self) -> float:
+        """Blur sigma of the usm kernel in pixels of the resized image, 0.3 to 10"""
+
+    @sharpen_radius.setter
+    def sharpen_radius(self, arg: float, /) -> None: ...
+
+    @property
+    def sharpen_threshold(self) -> float:
+        """Luma differences below this value (0 to 1) stay unsharpened"""
+
+    @sharpen_threshold.setter
+    def sharpen_threshold(self, arg: float, /) -> None: ...
 
     @property
     def centralize_dataset(self) -> str:
@@ -2618,8 +2904,15 @@ def run(path: str) -> None:
 def list_scene() -> None:
     """Print the scene graph tree"""
 
-def on_frame(callback: Callable) -> None:
-    """Register a callback to be called each frame with delta time (seconds)"""
+def on_frame(callback: Callable, duration_s: object | None = None) -> None:
+    """
+    Register a frame callback with an optional positive lifetime in seconds (defaults to 10 seconds).
+    """
+
+def set_frame_callback(callback: Callable, duration_s: object | None = None) -> None:
+    """
+    Register a frame callback with an optional positive lifetime in seconds (defaults to 10 seconds).
+    """
 
 def stop_animation() -> None:
     """Stop any running animation (clears frame callback)"""
@@ -2693,8 +2986,10 @@ def build_splat_lod_hierarchy(source: object | None = None, ratio: float = 0.5, 
     Build a script-side multi-level LOD hierarchy from SplatData or a scene node.
     """
 
-def detect_dataset_info(path: str) -> DatasetInfo:
-    """Detect dataset information from a directory path"""
+def detect_dataset_info(path: str, images_path: str | None = None) -> DatasetInfo:
+    """
+    Detect dataset information from a directory path; images_path replaces the detected images folder
+    """
 
 def is_dataset_path(path: str) -> bool:
     """Check whether a path can be treated as a dataset source"""
@@ -2729,5 +3024,15 @@ class CheckpointParams:
 
 def read_checkpoint_params(path: str) -> CheckpointParams | None:
     """Read training parameters from a checkpoint (None if failed)"""
+
+def detect_scene_apriltags(family: str = 'tag36h11', min_views: int = 2, min_parallax_deg: float = 1.5, max_reprojection_error_px: float = 3.0, max_hamming: int = 1, min_decision_margin: float = 25.0, active_cameras_only: bool = False, max_image_width: int = 0) -> dict:
+    """
+    Detect and triangulate AprilTags from a background editor script; viewer-thread calls are rejected
+    """
+
+def scale_scene_by_apriltags(constraints: Sequence[tuple[int, int, float]], family: str = 'tag36h11', inlier_relative_threshold: float = 0.02, inlier_absolute_threshold: float = 0.0, min_inliers: int = 1, min_inlier_ratio: float = 0.5, min_views: int = 2, min_parallax_deg: float = 1.5, max_reprojection_error_px: float = 3.0, max_hamming: int = 1, min_decision_margin: float = 25.0, active_cameras_only: bool = False, max_image_width: int = 0, manifest_path: str = '', apply_to_scene: bool = True, targets: Sequence[str] = []) -> dict:
+    """
+    Calibrate the complete scene from a background editor script. Explicit targets allow partial scaling; viewer-thread calls are rejected
+    """
 
 __all__: tuple = ('context', 'gaussians', 'session', 'get_scene', 'Tensor', 'Hook', 'ScopedHandler', 'SplatSimplifyResult', 'SplatSimplifyMergeTree', 'on_training_start', 'on_iteration_start', 'on_post_step', 'on_pre_optimizer_step', 'on_training_end', 'mesh_to_splat', 'is_mesh2splat_active', 'get_mesh2splat_progress', 'get_mesh2splat_stage', 'get_mesh2splat_error', 'simplify_splats', 'simplify_splat_data_with_history', 'build_splat_lod_hierarchy', 'cancel_splat_simplify', 'is_splat_simplify_active', 'get_splat_simplify_progress', 'get_splat_simplify_stage', 'get_splat_simplify_error', 'on_frame', 'stop_animation', 'on_scene_time', 'clear_scene_time', 'run', 'list_scene', 'mat4', 'colormap', 'help', 'scene', 'io', 'packages', 'mcp')

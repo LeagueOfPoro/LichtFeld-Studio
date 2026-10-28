@@ -59,7 +59,6 @@ set(CORE_SOURCES
         abi.cpp
         alloc_counter.cpp
         crash_handler.cpp
-        training_churn_metrics.cpp
         cuda_error.cpp
         cuda_error_typed.cpp
         device_fault.cpp
@@ -80,11 +79,16 @@ set(CORE_SOURCES
         animatable_property.cpp
         argument_parser.cpp
         camera.cpp
+        collision_volume.cpp
+        collision_walk.cpp
+        collision_voxelization.cpp
         checkpoint_format.cpp
+        crop_polygon.cpp
         image_loader.cpp
         cuda_version.cpp
         image_io.cpp
         image_codecs.cpp
+        image_exr.cpp
         mapped_file.cpp
         optimization_properties.cpp
         parameters.cpp
@@ -99,6 +103,7 @@ set(CORE_SOURCES
         octree_lod.cpp
         splat_data.cpp
         splat_data_mirror.cpp
+        splat_data_mirror_centroid.cu
         splat_data_transform.cpp
         splat_exportable_storage.cpp
         sh_value_quant.cpp
@@ -108,6 +113,7 @@ set(CORE_SOURCES
         mesh_data.cpp
         system_info.cpp
         user_paths.cpp
+        persisted_settings.cpp
         legacy_settings_migration.cpp
 )
 
@@ -155,7 +161,7 @@ target_link_libraries(lfs_core
         PNG::PNG
         TIFF::TIFF
         WebP::webp
-        unofficial::tinyexr::tinyexr
+        OpenEXR::OpenEXRCore
         OpenMeshCore
 )
 # OpenMP for tensor multi-threaded operations
@@ -191,9 +197,12 @@ if(MSVC)
     )
     target_link_options(lfs_core PRIVATE /ignore:4217)
 else()
+    # Release binaries and compiler-cache entries must not depend on the build
+    # host's CPU. Keep the explicit AVX2/FMA baseline below instead of enabling
+    # every instruction detected by -march=native on a hosted runner.
     target_compile_options(lfs_core PRIVATE
         $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Debug>>:-O0 -g -fno-omit-frame-pointer -DDEBUG>
-        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:-O3 -DNDEBUG -march=native>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:-O3 -DNDEBUG>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:-O0 -g --extended-lambda --expt-relaxed-constexpr>
         $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr>
     )

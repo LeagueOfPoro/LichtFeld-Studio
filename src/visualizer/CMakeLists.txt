@@ -6,8 +6,8 @@
 include(${CMAKE_SOURCE_DIR}/cmake/FetchLibvterm.cmake)
 include(${CMAKE_SOURCE_DIR}/cmake/CompileShaders.cmake)
 
-# SHARED on Windows to avoid singleton duplication across .exe/.pyd boundary
-if(WIN32)
+# SHARED on Windows, or when checking the same DLL export boundary on Linux.
+if(WIN32 OR LFS_HIDDEN_SYMBOLS)
     set(LFS_VIS_LIB_TYPE SHARED)
 else()
     set(LFS_VIS_LIB_TYPE STATIC)
@@ -97,6 +97,8 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         gui/perf_sampler.cpp
         gui/rml_status_bar.cpp
         gui/status_bar_mining.cpp
+        gui/status_bar_tessle.cpp
+        gui/status_bar_progress.cpp
         gui/gpu_memory_query.cpp
         gui/line_renderer.cpp
         gui/film_strip_renderer.cpp
@@ -129,12 +131,14 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         gui/video_widget_factory.cpp
 
         # Scene management
+        scene/apriltag_calibration.cpp
         scene/scene_manager.cpp
         scene/selection_state.cpp
         scene/viewer_splat_quantize.cpp
 
         # Input handling
         input/input_controller.cpp
+        input/gamepad_service.cpp
         input/input_router.cpp
         input/input_bindings.cpp
         input/sdl_key_mapping.cpp
@@ -145,7 +149,9 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
 
         # Tools
         tools/selection_tool.cpp
+        tools/point_pick_overlay.cpp
         tools/align_tool.cpp
+        tools/scale_distance_tool.cpp
         tools/unified_tool_registry.cpp
         tools/builtin_tools.cpp
 
@@ -165,7 +171,10 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         operator/operator_context.cpp
         operator/operator_id.cpp
         operator/operator_registry.cpp
+        operator/ops/point_pick_operator.cpp
         operator/ops/align_ops.cpp
+        operator/ops/scale_distance_ops.cpp
+        operator/ops/crop_polygon_ops.cpp
         operator/ops/edit_ops.cpp
         operator/ops/scene_ops.cpp
         operator/ops/selection_ops.cpp
@@ -189,6 +198,10 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         gui/panels/menu_bar.cpp
         gui/panels/menu_bar.hpp
         gui/utils/native_file_dialog.cpp
+        gui/utils/native_file_drag.cpp
+        gui/utils/native_file_drag_wayland.cpp
+        gui/utils/splat_transfer.cpp
+        gui/utils/splat_export_request.cpp
         gui/utils/drag_drop_native.cpp
         gui/utils/file_association.cpp
 
@@ -204,27 +217,11 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         gui/rmlui/elements/color_picker_element.cpp
         gui/rmlui/elements/crf_curve_element.cpp
         gui/rmlui/elements/loss_graph_element.cpp
+        gui/rmlui/elements/vram_timeline_element.cpp
         gui/rmlui/elements/python_editor_element.cpp
         gui/rmlui/elements/scene_graph_element.cpp
         gui/rmlui/elements/terminal_element.cpp
 )
-
-# These large visualizer TUs exceed the COFF section limit in Debug and need
-# /bigobj. Let CMake select the supported spelling of the C++23 language flag.
-if(MSVC)
-    set_source_files_properties(
-            ${CMAKE_CURRENT_SOURCE_DIR}/sequencer/rml_sequencer_panel.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/sequencer/rml_sequencer_panel_timeline.cpp
-            PROPERTIES COMPILE_OPTIONS "/bigobj"
-    )
-    set_source_files_properties(
-            ${CMAKE_CURRENT_SOURCE_DIR}/visualizer_impl.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/project/project_lifecycle.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/gui/gui_manager.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/scene/scene_manager.cpp
-            PROPERTIES COMPILE_OPTIONS "/bigobj"
-    )
-endif()
 
 # Set include directories
 target_include_directories(lfs_visualizer
@@ -258,6 +255,7 @@ target_link_libraries(lfs_visualizer
         nlohmann_json::nlohmann_json
         OpenSSL::SSL
         OpenSSL::Crypto
+        ZLIB::ZLIB
         CUDA::cudart
         Freetype::Freetype
         nfd::nfd
@@ -275,6 +273,9 @@ set_property(SOURCE
 # cmake/SetupNativeFileDialog.cmake.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET PkgConfig::LFS_GTK3)
     target_link_libraries(lfs_visualizer PRIVATE PkgConfig::LFS_GTK3)
+    pkg_check_modules(LFS_DRAG_WAYLAND REQUIRED IMPORTED_TARGET wayland-client)
+    target_link_libraries(lfs_visualizer PRIVATE PkgConfig::LFS_DRAG_WAYLAND)
+    target_compile_definitions(lfs_visualizer PRIVATE LFS_HAS_WAYLAND_DRAG=1)
 endif()
 
 target_sources(lfs_visualizer
@@ -284,6 +285,7 @@ target_sources(lfs_visualizer
         rendering/vksplat_input_packer.cpp
         rendering/vksplat_input_packer_cuda.cu
         rendering/vksplat_viewport_renderer.cpp
+        rendering/stochastic_viewport.cpp
         rendering/vulkan_external_tensor.cpp
         rendering/point_cloud_vulkan_renderer.cpp)
 
@@ -299,7 +301,8 @@ add_executable(lfs_shader_compiler EXCLUDE_FROM_ALL
         tools/shader_compiler.cpp)
 target_compile_features(lfs_shader_compiler PRIVATE cxx_std_23)
 target_include_directories(lfs_shader_compiler PRIVATE
-        ${CMAKE_SOURCE_DIR}/src)
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/core/include)
 target_link_libraries(lfs_shader_compiler
         PRIVATE
         glslang::glslang
@@ -308,6 +311,7 @@ target_link_libraries(lfs_shader_compiler
 
 set(LFS_VIEWPORT_SHADER_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/rendering/resources/viewport")
 set(LFS_VIEWPORT_SHADER_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/shaders/viewport")
+set(LFS_EQUIRECT_PROJECTION_SHADER "${CMAKE_SOURCE_DIR}/src/rendering/rasterizer/vulkan/shader/src/slang/equirect_projection.inc")
 target_include_directories(lfs_visualizer PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/shaders")
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/screen_quad.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/screen_quad.vert.spv.h" kScreenQuadVertSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/scene.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/scene.frag.spv.h" kSceneFragSpv)
@@ -323,19 +327,22 @@ compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/textured_overla
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/textured_overlay.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/textured_overlay.frag.spv.h" kTexturedOverlayFragSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/pivot.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/pivot.vert.spv.h" kPivotVertSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/pivot.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/pivot.frag.spv.h" kPivotFragSpv)
-compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/frustum.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/frustum.vert.spv.h" kFrustumVertSpv)
-compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh.vert.spv.h" kMeshVertSpv)
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/frustum.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/frustum.vert.spv.h" kFrustumVertSpv "${LFS_EQUIRECT_PROJECTION_SHADER}")
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh.vert.spv.h" kMeshVertSpv "${LFS_EQUIRECT_PROJECTION_SHADER}")
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh.geom" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh.geom.spv.h" kMeshGeomSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh.frag.spv.h" kMeshFragSpv)
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/collision_overlay.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/collision_overlay.vert.spv.h" kCollisionOverlayVertSpv)
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/collision_overlay.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/collision_overlay.frag.spv.h" kCollisionOverlayFragSpv "${LFS_EQUIRECT_PROJECTION_SHADER}")
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh_shadow.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh_shadow.vert.spv.h" kMeshShadowVertSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh_shadow.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh_shadow.frag.spv.h" kMeshShadowFragSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh_wireframe.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh_wireframe.vert.spv.h" kMeshWireframeVertSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/mesh_wireframe.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/mesh_wireframe.frag.spv.h" kMeshWireframeFragSpv)
-compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/environment.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/environment.frag.spv.h" kEnvironmentFragSpv)
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/environment.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/environment.frag.spv.h" kEnvironmentFragSpv "${LFS_EQUIRECT_PROJECTION_SHADER}")
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/depth_blit.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/depth_blit.frag.spv.h" kDepthBlitFragSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/split_view.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/split_view.frag.spv.h" kSplitViewFragSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/vksplat_compose.comp" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/vksplat_compose.comp.spv.h" kVkSplatComposeCompSpv
     "${CMAKE_SOURCE_DIR}/src/rendering/rasterizer/vulkan/shader/src/slang/display_color.inc")
-compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/point_cloud.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/point_cloud.vert.spv.h" kPointCloudVertSpv)
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/point_cloud.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/point_cloud.vert.spv.h" kPointCloudVertSpv "${LFS_EQUIRECT_PROJECTION_SHADER}")
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/point_cloud.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/point_cloud.frag.spv.h" kPointCloudFragSpv)
 
 target_link_libraries(lfs_visualizer
@@ -493,6 +500,7 @@ if (WIN32)
     )
     target_link_libraries(lfs_visualizer PRIVATE
             Advapi32    # Read the Windows application light/dark preference
+            Uuid
             Ole32       # OLE drag-drop (IDropTarget)
             Shell32     # SHChangeNotify (file association)
             dxgi        # DXGI per-process VRAM query

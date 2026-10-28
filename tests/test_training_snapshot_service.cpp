@@ -12,6 +12,7 @@
 #include "lfs/training/sh_value_codec.hpp"
 #include "lfs/training/sh_value_storage.hpp"
 #include "training/checkpoint.hpp"
+#include "training/components/popspa_controller.hpp"
 #include "training/optimizer/adam_optimizer.hpp"
 #include "training/project_snapshot_chapters.hpp"
 #include "training/strategies/mcmc.hpp"
@@ -243,7 +244,7 @@ namespace {
 
         std::ostringstream reference_stream(std::ios::binary | std::ios::out);
         const auto reference = lfs::training::serialize_checkpoint(
-            reference_stream, 500, strategy, params, nullptr, nullptr, nullptr, nullptr);
+            reference_stream, 500, strategy, params, nullptr, nullptr, nullptr);
         ASSERT_TRUE(reference.has_value())
             << lfs::format_for_developer(reference.error());
 
@@ -283,6 +284,66 @@ namespace {
         EXPECT_NE(
             lfs::format_for_developer(near_oom_explicit_save.error()).find("rejected"),
             std::string::npos);
+    }
+
+    // Fails if the gate defers without asking for memory, asks for the wrong
+    // amount, or ignores memory the callback released.
+    TEST(TrainingSnapshotServiceTest,
+         HostMemoryGateAsksForTheShortfallBeforeDeferring) {
+        if (!cuda_device_available()) {
+            GTEST_SKIP() << "CUDA device unavailable";
+        }
+
+        constexpr std::size_t GAUSSIAN_COUNT = 8192;
+        constexpr std::uint64_t GIB = 1024ull * 1024 * 1024;
+        auto params = make_snapshot_test_params(GAUSSIAN_COUNT);
+        auto model = make_snapshot_test_splat(GAUSSIAN_COUNT);
+        lfs::training::MCMC strategy(*model);
+        strategy.initialize(params.optimization);
+
+        std::ostringstream reference_stream(std::ios::binary | std::ios::out);
+        const auto reference = lfs::training::serialize_checkpoint(
+            reference_stream, 500, strategy, params, nullptr, nullptr, nullptr);
+        ASSERT_TRUE(reference.has_value())
+            << lfs::format_for_developer(reference.error());
+
+        const auto checkpoint_bytes = reference->bytes;
+        const ScopedEnvironmentVariable total_memory(
+            "LFS_TRAINING_SNAPSHOT_HOST_MEMORY_TOTAL_BYTES", std::to_string(16 * GIB));
+        ScopedEnvironmentVariable available_memory(
+            "LFS_TRAINING_SNAPSHOT_HOST_MEMORY_AVAILABLE_BYTES",
+            std::to_string(checkpoint_bytes + GIB));
+
+        lfs::training::TrainingSnapshotService service({
+            .ring_slots = 4,
+            .band_bytes = 64 * 1024,
+            .calibration_bytes = 64,
+            .calibration_iterations = 4,
+        });
+        lfs::training::TrainingSnapshotCaptureRequest request{
+            .iteration = 500,
+            .strategy = strategy,
+            .params = params,
+        };
+        ASSERT_TRUE(service.initialize(request));
+
+        std::uint64_t requested_bytes = 0;
+        request.release_host_memory = [&](const std::uint64_t bytes) -> std::uint64_t {
+            requested_bytes = bytes;
+            available_memory.set(std::to_string(checkpoint_bytes + 4 * GIB));
+            return bytes;
+        };
+        auto released_autosave = service.prepare(request);
+        ASSERT_TRUE(released_autosave.has_value())
+            << lfs::format_for_developer(released_autosave.error());
+        EXPECT_EQ(requested_bytes, 3 * GIB);
+
+        available_memory.set(std::to_string(checkpoint_bytes + GIB));
+        request.release_host_memory = [](std::uint64_t) -> std::uint64_t { return 0; };
+        auto deferred_autosave = service.prepare(request);
+        ASSERT_FALSE(deferred_autosave.has_value());
+        EXPECT_NE(lfs::format_for_developer(deferred_autosave.error()).find("deferred"),
+                  std::string::npos);
     }
 
     TEST(TrainingSnapshotServiceTest,
@@ -341,7 +402,7 @@ namespace {
             lfs::training::serialize_checkpoint(
                 reference_stream, SAVED_ITERATION,
                 strategy, params, nullptr, nullptr,
-                nullptr, nullptr);
+                nullptr);
         ASSERT_TRUE(reference_result.has_value())
             << lfs::format_for_developer(
                    reference_result.error());
@@ -461,7 +522,10 @@ namespace {
             metrics.cold_path_ms,
             metrics.prepare_stall_ms +
                 metrics.pause_ms);
-        EXPECT_TRUE(metrics.cold_path_within_rig_gate);
+        // Pinned bandwidth is calibrated once per process by whichever capture
+        // runs first, so the gate for these tiny captures depends on test order.
+        EXPECT_EQ(metrics.cold_path_within_rig_gate,
+                  metrics.cold_path_ms <= metrics.rig_gate_ms);
         EXPECT_GT(metrics.tensor_piece_count, 0u);
         EXPECT_GT(metrics.cpu_piece_count, 0u);
         EXPECT_TRUE(metrics.consistency_proven);
@@ -500,7 +564,7 @@ namespace {
                 captured_stream,
                 captured->checkpoint_bytes->size(),
                 target_strategy, loaded_params,
-                nullptr, nullptr, nullptr, nullptr,
+                nullptr, nullptr, nullptr,
                 {}, "snapshot-service test CKPT");
         ASSERT_TRUE(loaded.has_value())
             << loaded.error();
@@ -585,7 +649,7 @@ namespace {
             lfs::training::serialize_checkpoint(
                 reference_stream, SAVED_ITERATION,
                 strategy, params, nullptr, nullptr,
-                nullptr, nullptr);
+                nullptr);
         ASSERT_TRUE(reference_result.has_value())
             << lfs::format_for_developer(
                    reference_result.error());
@@ -865,9 +929,11 @@ namespace {
         EXPECT_EQ(
             header->iteration,
             SAVED_ITERATION);
-        EXPECT_TRUE(
+        EXPECT_EQ(
             captured->metrics
-                .pause_within_rig_gate);
+                .pause_within_rig_gate,
+            captured->metrics.pause_ms <=
+                captured->metrics.rig_gate_ms);
     }
 
     TEST(TrainingSnapshotServiceTest,
@@ -1024,6 +1090,56 @@ namespace {
             metrics.regression_percent, 9.0, 1e-12);
         EXPECT_TRUE(metrics.gate_evaluated);
         EXPECT_TRUE(metrics.within_gate);
+    }
+
+    TEST(TrainingSnapshotServiceTest, POPSpaControllerAndDedicatedAdamUseSnapshotStaging) {
+        if (!cuda_device_available())
+            GTEST_SKIP() << "CUDA device unavailable";
+        const ScopedEnvironmentVariable host_memory(
+            "LFS_TRAINING_SNAPSHOT_HOST_MEMORY_AVAILABLE_BYTES",
+            std::to_string(64ull * 1024 * 1024 * 1024));
+        auto model = make_snapshot_test_splat(4);
+        auto params = make_snapshot_test_params(4);
+        auto& p = params.optimization;
+        p.enable_sparsity = true;
+        p.popspa_target_count = 4;
+        p.popspa_first_prune_count = 4;
+        lfs::training::MCMC strategy(*model);
+        lfs::training::POPSpaController controller;
+        lfs::training::POPSpaController::Config config;
+        config.target_count = 4;
+        config.first_prune_count = 4;
+        ASSERT_TRUE(controller.initialize(config, model->opacity_raw(), 2).has_value());
+        lfs::training::AdamConfig adam_config;
+        adam_config.param_lrs = {{"means", p.popspa_means_lr}, {"scaling", p.popspa_scales_lr}, {"rotation", p.popspa_quaternions_lr}, {"opacity", p.popspa_opacities_lr}, {"sh0", p.popspa_sh0_lr}, {"shN", p.popspa_shn_lr}};
+        lfs::training::AdamOptimizer optimizer(*model, adam_config);
+        optimizer.allocate_gradients();
+        const int iteration = static_cast<int>(p.iterations);
+        std::ostringstream reference(std::ios::binary);
+        ASSERT_TRUE(lfs::training::serialize_checkpoint(reference, iteration, strategy, params,
+                                                        nullptr, nullptr, nullptr, &controller, &optimizer)
+                        .has_value());
+        const auto bytes = reference.str();
+        lfs::training::TrainingSnapshotService service({.ring_slots = 2, .band_bytes = 64 * 1024, .calibration_bytes = 64, .calibration_iterations = 1});
+        const lfs::training::TrainingSnapshotCaptureRequest request{
+            .iteration = iteration,
+            .strategy = strategy,
+            .params = params,
+            .popspa_controller = &controller,
+            .popspa_optimizer = &optimizer};
+        ASSERT_TRUE(service.initialize(request).has_value());
+        auto prepared = service.prepare(request);
+        ASSERT_TRUE(prepared.has_value()) << lfs::format_for_developer(prepared.error());
+        EXPECT_EQ(prepared->checkpoint_bytes(), bytes.size());
+        auto pending = service.capture(std::move(*prepared), request);
+        ASSERT_TRUE(pending.has_value()) << lfs::format_for_developer(pending.error());
+        model->opacity_raw().fill_(3.0f);
+        ASSERT_TRUE(controller.finish_score_view().has_value());
+        auto captured = pending->wait();
+        ASSERT_TRUE(captured.has_value()) << lfs::format_for_developer(captured.error());
+        ASSERT_EQ(captured->checkpoint_bytes->size(), bytes.size());
+        EXPECT_EQ(std::memcmp(captured->checkpoint_bytes->data(), bytes.data(), bytes.size()), 0);
+        EXPECT_TRUE(captured->metrics.consistency_proven);
     }
 
 } // namespace

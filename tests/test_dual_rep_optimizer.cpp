@@ -165,7 +165,7 @@ TEST(DualRepOptimizer, CheckpointRoundtripAfterFusedPrepareWithQuantOn) {
 
     ASSERT_TRUE(lfs::test::write_checkpoint_fixture(
                     temp_dir, past_warmup, strategy, params,
-                    nullptr, nullptr, nullptr, nullptr)
+                    nullptr, nullptr, nullptr)
                     .has_value());
 
     auto target_model = std::make_unique<SplatData>(make_sh_splat(1, sh_degree));
@@ -174,7 +174,7 @@ TEST(DualRepOptimizer, CheckpointRoundtripAfterFusedPrepareWithQuantOn) {
     auto load_params = params;
     const auto loaded = load_checkpoint(
         lfs::test::checkpoint_fixture_path(temp_dir), target,
-        load_params, nullptr, nullptr, nullptr, nullptr);
+        load_params, nullptr, nullptr, nullptr);
     ASSERT_TRUE(loaded.has_value()) << loaded.error()
                                     << " — save→load after fused prepare must not throw "
                                        "'state size does not match model'";
@@ -381,6 +381,46 @@ TEST(DualRepOptimizer, JointAddNewParamsGatherShNGrowsMoments) {
         << "joint gather must grow packed moment buffer";
 }
 
+TEST(DualRepOptimizer, LazyShNGradientGrowsWithMcmcGather) {
+    CodecsOnGuard guard;
+    constexpr size_t n0 = 30;
+    constexpr size_t n_new = 8;
+    auto splat = make_sh_splat(n0, 3);
+    ASSERT_TRUE(sh_value::apply_shN_value_quant(splat));
+
+    AdamOptimizer opt(splat, make_cfg(64));
+    opt.allocate_gradients(64);
+    auto* state = opt.get_state_mutable(ParamType::ShN);
+    ASSERT_NE(state, nullptr);
+    ASSERT_FALSE(state->grad.is_valid());
+
+    // 3DGUT materializes shN gradients only after the first SH band activates.
+    auto& grad = opt.get_grad(ParamType::ShN);
+    ASSERT_EQ(grad.shape()[0], state->size);
+    ASSERT_TRUE(sh_value::ensure_shN_fp32_for_mutation(splat));
+
+    auto indices = Tensor::arange(0.0f, static_cast<float>(n_new), 1.0f)
+                       .to(DataType::Int64)
+                       .to(Device::CUDA);
+    splat.means().reserve(n0 + n_new + 8);
+    splat.means().append_zeros(n_new);
+    splat.sh0().reserve(n0 + n_new + 8);
+    splat.sh0().append_zeros(n_new);
+    splat.scaling_raw().reserve(n0 + n_new + 8);
+    splat.scaling_raw().append_zeros(n_new);
+    splat.rotation_raw().reserve(n0 + n_new + 8);
+    splat.rotation_raw().append_zeros(n_new);
+    splat.opacity_raw().reserve(n0 + n_new + 8);
+    splat.opacity_raw().append_zeros(n_new);
+
+    opt.add_new_params_gather(ParamType::ShN, indices);
+    state = opt.get_state_mutable(ParamType::ShN);
+    ASSERT_NE(state, nullptr);
+    EXPECT_EQ(state->grad.shape()[0], state->size);
+    EXPECT_NO_THROW(opt.zero_grad(1001));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+}
+
 // ---------------------------------------------------------------------------
 // n_primitives set; N%256≠0 prepare does not set q16 OOB conditions
 // ---------------------------------------------------------------------------
@@ -487,9 +527,6 @@ TEST(DualRepOptimizer, MRNF_PerSplatMeanStepWithQuantizedAdamIsFinite) {
     opt_params.iterations = 200;
     opt_params.max_cap = 32;
     opt_params.sh_degree_interval = 10000;
-    // The per-splat mean step ships behind the opt-in Background Improvements
-    // switch; the test exercises that path, so it must opt in.
-    opt_params.background_improvements = true;
     ASSERT_NO_THROW(strategy.initialize(opt_params));
 
     std::vector<float> log_s(8 * 3);
@@ -585,7 +622,7 @@ TEST(DualRepOptimizer, MCMC_QuantOn_MidRunSaveLoadResume) {
 
     ASSERT_TRUE(lfs::test::write_checkpoint_fixture(
                     temp_dir, mid_iter, strategy, params,
-                    nullptr, nullptr, nullptr, nullptr)
+                    nullptr, nullptr, nullptr)
                     .has_value());
 
     auto target_model = std::make_unique<SplatData>(make_sh_splat(1, sh_degree));
@@ -594,7 +631,7 @@ TEST(DualRepOptimizer, MCMC_QuantOn_MidRunSaveLoadResume) {
     auto load_params = params;
     const auto loaded = load_checkpoint(
         lfs::test::checkpoint_fixture_path(temp_dir), target,
-        load_params, nullptr, nullptr, nullptr, nullptr);
+        load_params, nullptr, nullptr, nullptr);
     ASSERT_TRUE(loaded.has_value()) << loaded.error()
                                     << " — quantized mid-run resume must load";
     EXPECT_EQ(*loaded, mid_iter);

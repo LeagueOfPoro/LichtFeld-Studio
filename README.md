@@ -23,7 +23,7 @@ LichtFeld Studio lets you train new scenes from COLMAP datasets, resume checkpoi
 
 [**Download Windows (Portal)**](https://portal.lichtfeld.io/) •
 [**Build From Source**](docs/building_and_distribution.md) •
-[**Plugin System**](docs/plugin-system.md) •
+[**Python API and Plugins**](docs/plugins/README.md) •
 [**MCP Guide**](docs/docs/development/mcp/index.md) •
 [**Support Development**](#support-development) •
 [**Join Discord**](https://discord.gg/TbxJST2BbC)
@@ -81,6 +81,22 @@ LichtFeld Studio is built for users who need more than a training script or a st
 - **Research-ready features**: MCMC optimization, bilateral grid appearance modeling, 3DGUT support for distorted camera models, and timelapse generation
 - **Native performance**: modern C++23 and CUDA 12.8+ for responsive training and visualization on NVIDIA hardware
 
+### Optional POPSpa sparsification
+
+In the Training panel, enable **Sparsity** and set **Target Gaussians** under
+**Sparsity Settings**. The CLI equivalent is:
+
+```text
+--enable-sparsity --popspa-target-count 256000
+```
+
+POPSpa runs after regular training: contribution scoring, an intermediate prune,
+sparse optimization, an exact final prune, and recovery. It supports FastGS and
+the bundled gsplat/GUT backend. The target must fit the active model count and
+retain all frozen Gaussians. Phase lengths and advanced controls are available as
+`popspa_*` settings in the UI, JSON, and Python.
+The equations follow [KissGsVanilla](https://github.com/OpsiClear/KissGsVanilla/tree/5d5212a33a45a6668beb822f17b4b2d88e0f5f8a) (Apache-2.0), implemented independently in LichtFeld Studio's C++/CUDA.
+
 ## Support Development
 
 LichtFeld Studio is free and open source. If it is useful in your research, production, or learning workflow, please consider supporting its continued development.
@@ -113,7 +129,7 @@ Current project notes:
 - [Project Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/)
 - [FAQ](https://github.com/MrNeRF/LichtFeld-Studio/wiki/Frequently-Asked-Questions)
 - [Source Build Guide](docs/building_and_distribution.md)
-- [Plugin System](docs/plugin-system.md)
+- [Python API and Plugins](docs/plugins/README.md)
 - [Plugin Developer Guide](docs/plugins/getting-started.md)
 - [MCP Guide](docs/docs/development/mcp/index.md)
 - [Plugin Examples](docs/plugins/examples/README.md)
@@ -142,7 +158,10 @@ Getting started:
 
 <p>
   <a href="https://www.core11.eu/">
-    <img src="docs/media/core11_multi.svg" alt="Core 11" height="60">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/media/core11-dark.svg">
+      <img src="docs/media/core11.svg" alt="Core 11" height="60">
+    </picture>
   </a>
 </p>
 
@@ -152,7 +171,7 @@ Getting started:
   <a href="https://web.volinga.ai/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/media/volinga-dark.svg">
-      <img src="docs/media/volinga.svg" alt="Volinga" height="108">
+      <img src="docs/media/volinga.svg" alt="Volinga" height="50">
     </picture>
   </a>
 </p>
@@ -160,14 +179,14 @@ Getting started:
 <br>
 
 <p>
+  <sub>Hardware sponsor</sub>
+  <br>
   <a href="https://www.tersus-gnss.com/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/media/tersus-dark.svg">
-      <img src="docs/media/tersus.svg" alt="Tersus GNSS" height="80">
+      <img src="docs/media/tersus.svg" alt="Tersus GNSS" height="120">
     </picture>
   </a>
-  <br>
-  <sub>Hardware sponsor</sub>
 </p>
 
 </div>
@@ -185,7 +204,7 @@ Getting started:
 
 ## License
 
-This project is licensed under GPLv3. See [LICENSE](LICENSE) for details.
+This project is licensed under GPLv3 or later. See [LICENSE](LICENSE) for details. It includes an additional permission for NVIDIA GPU libraries (the CUDA Toolkit runtime libraries, nvJPEG2000, the NVIDIA driver and Video Codec SDK runtime, DLSS/NGX); see [LICENSE-EXCEPTION.txt](LICENSE-EXCEPTION.txt).
 
 #### _Agents_
 
